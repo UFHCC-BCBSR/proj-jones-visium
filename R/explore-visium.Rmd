@@ -365,10 +365,10 @@ for(sample_id in names(spatial_filtered)) {
   obj <- RunPCA(obj, assay = "SCT", npcs = 50, verbose = FALSE)
   
 # UMAP for visualization
-  obj <- RunUMAP(obj, reduction = "PCA", dims = 1:30, verbose = FALSE)
+  obj <- RunUMAP(obj, reduction = "pca", dims = 1:30, verbose = FALSE)
   
 # Clustering
-  obj <- FindNeighbors(obj, reduction = "PCA", dims = 1:30, verbose = FALSE)
+  obj <- FindNeighbors(obj, reduction = "pca", dims = 1:30, verbose = FALSE)
   obj <- FindClusters(obj, resolution = 0.5, verbose = FALSE)
   
   spatial_filtered[[sample_id]] <- obj
