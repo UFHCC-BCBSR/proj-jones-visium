@@ -351,27 +351,37 @@ We use **SCTransform** (Hafemeister & Satija 2019, Genome Biology) for normaliza
 cat("Normalizing and processing samples...\n")
 
 for(sample_id in names(spatial_filtered)) {
-  cat(paste0("  Processing ", sample_id, "...\n"))
+  rds_file <- paste0("../results/Filtered_", sample_id, "_Spatial.rds")
   
-  obj <- spatial_filtered[[sample_id]]
-  
-# SCTransform normalization
-  obj <- SCTransform(obj, 
-                     assay = "Spatial", 
-                     vars.to.regress = "percent.mt",
-                     verbose = FALSE)
-  
-# PCA for dimensionality reduction
-  obj <- RunPCA(obj, assay = "SCT", npcs = 50, verbose = FALSE)
-  
-# UMAP for visualization
-  obj <- RunUMAP(obj, reduction = "pca", dims = 1:30, verbose = FALSE)
-  
-# Clustering
-  obj <- FindNeighbors(obj, reduction = "pca", dims = 1:30, verbose = FALSE)
-  obj <- FindClusters(obj, resolution = 0.5, verbose = FALSE)
-  
-  spatial_filtered[[sample_id]] <- obj
+  if(file.exists(rds_file)) {
+    cat(paste0("  Loading existing ", sample_id, " from disk...\n"))
+    spatial_filtered[[sample_id]] <- readRDS(rds_file)
+  } else {
+    cat(paste0("  Processing ", sample_id, "...\n"))
+    
+    obj <- spatial_filtered[[sample_id]]
+    
+    # SCTransform normalization
+    obj <- SCTransform(obj,
+                       assay = "Spatial",
+                       vars.to.regress = "percent.mt",
+                       verbose = FALSE)
+    
+    # PCA for dimensionality reduction
+    obj <- RunPCA(obj, assay = "SCT", npcs = 50, verbose = FALSE)
+    
+    # UMAP for visualization
+    obj <- RunUMAP(obj, reduction = "pca", dims = 1:30, verbose = FALSE)
+    
+    # Clustering
+    obj <- FindNeighbors(obj, reduction = "pca", dims = 1:30, verbose = FALSE)
+    obj <- FindClusters(obj, resolution = 0.5, verbose = FALSE)
+    
+    spatial_filtered[[sample_id]] <- obj
+    
+    # Save processed object
+    saveRDS(obj, file = rds_file)
+  }
 }
 
 cat("All samples normalized and processed.\n")
@@ -403,53 +413,104 @@ cat("MERGING SAMPLES BY GROUP\n")
 cat(strrep("=", 80), "\n\n")
 
 # Separate samples by group
-group_A_samples <- spatial_filtered[grep("^A", names(spatial_filtered))]
-group_D_samples <- spatial_filtered[grep("^D", names(spatial_filtered))]
+# Exclude A2 from Group A
+group_A_samples <- spatial_filtered[c("A1", "A3", "A4")]  # Remove A2
 
-cat(paste0("Group A samples: ", paste(names(group_A_samples), collapse = ", "), "\n"))
-cat(paste0("Group D samples: ", paste(names(group_D_samples), collapse = ", "), "\n\n"))
+cat(paste0("Group A samples (A2 excluded due to extreme low quality): ", 
+           paste(names(group_A_samples), collapse = ", "), "\n"))
+group_D_samples <- spatial_filtered[c("D1", "D3", "D4")] # Remove D2
+cat(paste0("Group D samples (D2 excluded due to extreme low quality): ", 
+           paste(names(group_D_samples), collapse = ", "), "\n"))
 ```
 
 ## Merge Group A
 
 ```{r merge-group-A}
-cat("Merging Group A samples...\n")
+rds_file_A <- "../results/Group_A_Merged_Spatial.rds"
 
-if(length(group_A_samples) > 0) {
-# Merge samples
-  group_A_merged <- merge(x = group_A_samples[[1]],
-                          y = group_A_samples[-1],
-                          add.cell.ids = names(group_A_samples),
-                          project = "Group_A")
+if(file.exists(rds_file_A)) {
+  cat("Loading existing Group A merged object from disk...\n")
+  group_A_merged <- readRDS(rds_file_A)
+  cat(paste0("  Loaded ", ncol(group_A_merged), " spots\n"))
+} else {
+  cat("Merging Group A samples...\n")
   
-  cat(paste0("  Total spots: ", ncol(group_A_merged), "\n"))
-  cat(paste0("  Total genes: ", nrow(group_A_merged), "\n\n"))
-  
-# Re-normalize merged object
-  cat("  Re-normalizing merged Group A...\n")
-  group_A_merged <- SCTransform(group_A_merged, 
-                                assay = "Spatial",
-                                vars.to.regress = c("percent.mt", "sample_id"),
-                                verbose = FALSE)
-  
-# Dimensionality reduction
-  group_A_merged <- RunPCA(group_A_merged, assay = "SCT", npcs = 50, verbose = FALSE)
-  group_A_merged <- RunUMAP(group_A_merged, reduction = "PCA", dims = 1:30, verbose = FALSE)
-  
-# Clustering
-  group_A_merged <- FindNeighbors(group_A_merged, reduction = "PCA", dims = 1:30, verbose = FALSE)
-  group_A_merged <- FindClusters(group_A_merged, resolution = 0.5, verbose = FALSE)
-  
-  cat("  Group A processing complete.n\n")
+  if(length(group_A_samples) > 0) {
+    # Merge samples
+    group_A_merged <- merge(x = group_A_samples[[1]],
+                            y = group_A_samples[-1],
+                            add.cell.ids = names(group_A_samples),
+                            project = "Group_A")
+    
+    cat(paste0("  Total spots: ", ncol(group_A_merged), "\n"))
+    cat(paste0("  Total genes: ", nrow(group_A_merged), "\n\n"))
+    
+    # Re-normalize merged object
+    cat("  Re-normalizing merged Group A...\n")
+    group_A_merged <- SCTransform(group_A_merged,
+                                  assay = "Spatial",
+                                  vars.to.regress = "percent.mt",
+                                  verbose = FALSE)
+    
+    # Dimensionality reduction
+    group_A_merged <- RunPCA(group_A_merged, assay = "SCT", npcs = 50, verbose = FALSE)
+    
+    cat("  Group A processing complete.\n\n")
+    
+    # Save
+    saveRDS(group_A_merged, file = rds_file_A)
+  }
 }
+
+# Check for sample_id batch effect
+DimPlot(group_A_merged, reduction="pca", group.by="sample_id")
+```
+
+## Integrate group A samples with harmony
+
+```{r harmony-A }
+# Check if harmony already run (object has harmony reduction)
+if("harmony" %in% names(group_A_merged@reductions)) {
+  cat("Harmony integration already completed for Group A\n")
+} else {
+  cat("Running Harmony integration for Group A...\n")
+  library(harmony)
+  
+  # Run Harmony to integrate samples
+  group_A_merged <- RunHarmony(group_A_merged,
+                               group.by.vars = "sample_id",
+                               dims = 1:30,
+                               verbose = FALSE)
+  
+  # Use harmony reduction for UMAP and clustering
+  group_A_merged <- RunUMAP(group_A_merged, reduction = "harmony", dims = 1:30)
+  group_A_merged <- FindNeighbors(group_A_merged, reduction = "harmony", dims = 1:30)
+  group_A_merged <- FindClusters(group_A_merged, resolution = 0.5)
+  
+  # Save updated object
+  saveRDS(group_A_merged, file = "../results/Group_A_Merged_Spatial.rds")
+  
+  cat("  Group A Harmony complete.\n\n")
+}
+
+# Check for resolution of sample_id effect
+DimPlot(group_A_merged, reduction="umap", group.by="sample_id")
+DimPlot(group_A_merged, reduction="umap")
 ```
 
 ## Merge Group D
 
 ```{r merge-group-D}
-cat("Merging Group D samples...\n")
+rds_file_D <- "../results/Group_D_Merged_Spatial.rds"
 
-if(length(group_D_samples) > 0) {
+if(file.exists(rds_file_D)) {
+  cat("Loading existing Group D merged object from disk...\n")
+  group_D_merged <- readRDS(rds_file_D)
+  cat(paste0("  Loaded ", ncol(group_D_merged), " spots\n"))
+} else {
+  cat("Merging Group D samples...\n")
+  
+  if(length(group_D_samples) > 0) {
 # Merge samples
   group_D_merged <- merge(x = group_D_samples[[1]],
                           y = group_D_samples[-1],
@@ -461,43 +522,47 @@ if(length(group_D_samples) > 0) {
   
 # Re-normalize merged object
   cat("  Re-normalizing merged Group D...\n")
-  group_D_merged <- SCTransform(group_D_merged, 
-                                assay = "Spatial",
-                                vars.to.regress = c("percent.mt", "sample_id"),
-                                verbose = FALSE)
+  # Group D
+group_D_merged <- SCTransform(group_D_merged, 
+                              assay = "Spatial",
+                              vars.to.regress = "percent.mt", 
+                              verbose = FALSE)
   
 # Dimensionality reduction
-  group_D_merged <- RunPCA(group_D_merged, assay = "SCT", npcs = 50, verbose = FALSE)
-  group_D_merged <- RunUMAP(group_D_merged, reduction = "PCA", dims = 1:30, verbose = FALSE)
-  
-# Clustering
-  group_D_merged <- FindNeighbors(group_D_merged, reduction = "PCA", dims = 1:30, verbose = FALSE)
-  group_D_merged <- FindClusters(group_D_merged, resolution = 0.5, verbose = FALSE)
-  
-  cat("  Group D processing complete.n\n")
+group_D_merged <- RunPCA(group_D_merged, assay = "SCT", npcs = 50, verbose = FALSE)
+# Save
+    saveRDS(group_D_merged, file = rds_file_D)
+  }
 }
+# Check for sample_id batch effect
+DimPlot(group_D_merged,reduction="pca",group.by="sample_id")
+```
+
+```{r harmony-D }
+if("harmony" %in% names(group_D_merged@reductions)) {
+  cat("Harmony integration already completed for Group D\n")
+} else {
+  cat("Running Harmony integration for Group D...\n")
+  
+# Run Harmony to integrate samples
+group_D_merged <- RunHarmony(group_D_merged, 
+                             group.by.vars = "sample_id",
+                             dims.use = 1:30,
+                             verbose = FALSE)
+
+# Use harmony reduction for UMAP and clustering
+group_D_merged <- RunUMAP(group_D_merged, reduction = "harmony", dims = 1:30)
+group_D_merged <- FindNeighbors(group_D_merged, reduction = "harmony", dims = 1:30)
+group_D_merged <- FindClusters(group_D_merged, resolution = 0.5)
+  saveRDS(group_D_merged, file = "../results/Group_D_Merged_Spatial.rds")
+}
+
+# Check for resolution of sample_id effect
+DimPlot(group_D_merged,reduction="umap",group.by="sample_id")
+DimPlot(group_D_merged,reduction="umap")
 ```
 
 ---
-
-# Part 7: Save Processed Objects
-
-```{r save-objects}
-cat("Saving processed objects...\n")
-
-# Save individual filtered and processed samples
-for(sample_id in names(spatial_filtered)) {
-  saveRDS(spatial_filtered[[sample_id]], 
-          file = paste0("Filtered_", sample_id, "_Spatial.rds"))
-  cat(paste0("  Saved ", sample_id, "\n"))
-}
-
-# Save merged objects
-saveRDS(group_A_merged, file = "Group_A_Merged_Spatial.rds")
-saveRDS(group_D_merged, file = "Group_D_Merged_Spatial.rds")
-
-cat("\nAll objects saved successfully.\n")
-```
 
 ```{r merged-summary-stats}
 # Summary of merged objects
@@ -612,136 +677,78 @@ print(p10)
 
 ---
 
-# Part 9: Batch Effect Assessment
+# Part 9: Find Cluster Markers
 
-```{r batch-assessment}
-cat("\n")
-cat(strrep("=", 80), "\n")
-cat("BATCH EFFECT ASSESSMENT\n")
-cat(strrep("=", 80), "\n\n")
+## Find cluster markers for group A
 
-assess_batch_effects <- function(seurat_obj, group_name) {
-  
-  cat(paste0("### ", group_name, "\n\n"))
-  
-# Check PC association with sample
-  pca_embeddings <- Embeddings(seurat_obj, reduction = "pca")[, 1:10]
-  sample_ids <- seurat_obj$sample_id
-  
-  pc_pvalues <- sapply(1:10, function(pc) {
-    summary(aov(pca_embeddings[, pc] ~ sample_ids))[[1]][["Pr(>F)"]][1]
-  })
-  
-  cat("**PC1-10 association with sample:**n\n")
-  for(i in 1:10) {
-    sig <- ifelse(pc_pvalues[i] < 0.001, " ***", 
-                  ifelse(pc_pvalues[i] < 0.01, " **",
-                         ifelse(pc_pvalues[i] < 0.05, " *", "")))
-    cat(paste0("- PC", i, ": p = ", formatC(pc_pvalues[i], format = "e", digits = 2), sig, "\n"))
-  }
-  
-  if(sum(pc_pvalues < 0.05) >= 5) {
-    cat("\n**WARNING:** Strong batch effects detected (>=5 PCs associated with sample)n\n")
-    cat("**Recommendations:**\n")
-    cat("- Consider Harmony integration\n")
-    cat("- Use sample_id as covariate in differential expression\n")
-    cat("- Interpret results with cautionn\n")
-  } else if(sum(pc_pvalues < 0.05) >= 2) {
-    cat("\n**CAUTION:** Moderate batch effects detected\n")
-    cat("Monitor for sample-specific clusters in downstream analysis.n\n")
-  } else {
-    cat("\n**GOOD:** Minimal batch effects detectedn\n")
-  }
-  
-# QC metrics by sample
-  qc_by_sample <- seurat_obj@meta.data %>%
-    group_by(sample_id) %>%
-    summarize(
-      N_Spots = n(),
-      Mean_UMI = round(mean(nCount_Spatial), 0),
-      Mean_Genes = round(mean(nFeature_Spatial), 0),
-      Mean_MT = round(mean(percent.mt), 2)
-    )
-  
-  cat("**QC Metrics by Sample:**n\n")
-  print(kable(qc_by_sample) %>% kable_styling())
-  cat("\n")
-  
-# Statistical tests
-  umi_test <- kruskal.test(nCount_Spatial ~ sample_id, data = seurat_obj@meta.data)
-  genes_test <- kruskal.test(nFeature_Spatial ~ sample_id, data = seurat_obj@meta.data)
-  
-  cat(paste0("**Kruskal-Wallis test for UMI differences:** p = ", 
-             formatC(umi_test$p.value, format = "e", digits = 2), "\n"))
-  cat(paste0("**Kruskal-Wallis test for gene differences:** p = ", 
-             formatC(genes_test$p.value, format = "e", digits = 2), "\n\n"))
-  
-  if(umi_test$p.value < 0.001 | genes_test$p.value < 0.001) {
-    cat("**WARNING:** Significant QC differences between samples may confound biological comparisons.n\n")
-  }
-  
-  return(list(pc_pvalues = pc_pvalues, qc_summary = qc_by_sample))
-}
+```{r find-markers-A}
+# Join all layers into single layers
+group_A_merged[["Spatial"]] <- JoinLayers(group_A_merged[["Spatial"]])
 
-# Assess both groups
-batch_A <- assess_batch_effects(group_A_merged, "Group A")
-batch_D <- assess_batch_effects(group_D_merged, "Group D")
-```
+# Verify layers are joined
+Layers(group_A_merged, assay = "Spatial")
+group_A_merged <- NormalizeData(group_A_merged, assay = "Spatial", verbose = TRUE)
 
----
+# Set default assay and identities
+DefaultAssay(group_A_merged) <- "Spatial"
+Idents(group_A_merged) <- group_A_merged$seurat_clusters
 
-# Part 10: Find Cluster Markers
-
-```{r find-markers}
-cat(strrep("=", 80), "\n")
-cat("FINDING CLUSTER MARKERS\n")
-cat(strrep("=", 80), "\n\n")
-
-# Group A markers
-cat("Finding markers for Group A clusters...\n")
-Idents(group_A_merged) <- "seurat_clusters"
-
-markers_A <- FindAllMarkers(group_A_merged, 
+markers_A <- FindAllMarkers(group_A_merged,
                             only.pos = TRUE,
-                            min.pct = 0.25,
-                            logfc.threshold = 0.5,
+                            min.pct = 0.05,
+                            logfc.threshold = 0.15,
                             test.use = "wilcox",
-                            verbose = FALSE)
+                            verbose = TRUE)
+
+cat(paste0("Found ", nrow(markers_A), " markers\n"))
 
 top10_A <- markers_A %>%
   group_by(cluster) %>%
   top_n(n = 10, wt = avg_log2FC)
 
-write.csv(markers_A, "Group_A_Cluster_Markers.csv", row.names = FALSE)
-write.csv(top10_A, "Group_A_Top10_Markers.csv", row.names = FALSE)
+write.csv(markers_A, "../results/Group_A_Cluster_Markers.csv", row.names = FALSE)
+write.csv(top10_A, "../results/Group_A_Top10_Markers.csv", row.names = FALSE)
 
 cat(paste0("  Found markers for ", length(unique(markers_A$cluster)), " clusters\n"))
 cat(paste0("  Total marker genes: ", nrow(markers_A), "\n"))
-cat("  Saved to Group_A_Cluster_Markers.csvn\n")
+cat("  Saved to ../results/Group_A_Cluster_Markers.csv\n")
 
-# Group D markers
-cat("Finding markers for Group D clusters...\n")
-Idents(group_D_merged) <- "seurat_clusters"
+```
 
-markers_D <- FindAllMarkers(group_D_merged, 
+## Find cluster markers for Group D
+
+```{r find-markers-D}
+# Join all layers into single layers
+group_D_merged[["Spatial"]] <- JoinLayers(group_D_merged[["Spatial"]])
+
+# Verify layers are joined
+Layers(group_D_merged, assay = "Spatial")
+group_D_merged <- NormalizeData(group_D_merged, assay = "Spatial", verbose = TRUE)
+
+# Set default assay and identities
+DefaultAssay(group_D_merged) <- "Spatial"
+Idents(group_D_merged) <- group_D_merged$seurat_clusters
+
+markers_D <- FindAllMarkers(group_D_merged,
                             only.pos = TRUE,
-                            min.pct = 0.25,
-                            logfc.threshold = 0.5,
+                            min.pct = 0.01,
+                            logfc.threshold = 0.15,
                             test.use = "wilcox",
-                            verbose = FALSE)
+                            verbose = TRUE)
+
+cat(paste0("Found ", nrow(markers_D), " markers\n"))
 
 top10_D <- markers_D %>%
   group_by(cluster) %>%
   top_n(n = 10, wt = avg_log2FC)
 
-write.csv(markers_D, "Group_D_Cluster_Markers.csv", row.names = FALSE)
-write.csv(top10_D, "Group_D_Top10_Markers.csv", row.names = FALSE)
+write.csv(markers_A, "../results/Group_D_Cluster_Markers.csv", row.names = FALSE)
+write.csv(top10_A, "../results/Group_D_Top10_Markers.csv", row.names = FALSE)
 
-cat(paste0("  Found markers for ", length(unique(markers_D$cluster)), " clusters\n"))
-cat(paste0("  Total marker genes: ", nrow(markers_D), "\n"))
-cat("  Saved to Group_D_Cluster_Markers.csvn\n")
+cat(paste0("  Found markers for ", length(unique(markers_A$cluster)), " clusters\n"))
+cat(paste0("  Total marker genes: ", nrow(markers_A), "\n"))
+cat("  Saved to ../results/Group_D_Cluster_Markers.csvn\n")
 
-cat(strrep("=", 80), "\n\n")
 ```
 
 ## Top Markers Preview
@@ -783,7 +790,7 @@ kable(top3_D,
 ```{r viz-markers, results='hide', fig.show='hide'}
 cat("Generating marker visualization plots...\n")
 
-pdf("Cluster_Markers_Visualization.pdf", width = 20, height = 14)
+pdf("../results/Cluster_Markers_Visualization.pdf", width = 20, height = 14)
 
 # Group A - top 3 markers per cluster
 cat("  Plotting Group A markers...\n")
@@ -841,7 +848,137 @@ for(clust in unique(top3_viz_D$cluster)) {
 
 dev.off()
 
-cat("Marker visualizations saved to Cluster_Markers_Visualization.pdf\n")
+cat("Marker visualizations saved to ../results/Cluster_Markers_Visualization.pdf\n")
+```
+
+## View cluster markers on clusers in UMAP space
+
+### Group A
+
+```{r markers-dimplot}
+# Top 3 markers for each cluster on UMAP
+top3_A <- markers_A %>%
+  group_by(cluster) %>%
+  top_n(n = 3, wt = avg_log2FC)
+
+# Feature plots on UMAP
+for(clust in unique(top3_A$cluster)) {
+  genes <- top3_A %>% filter(cluster == clust) %>% pull(gene)
+  
+  p <- FeaturePlot(group_A_merged, 
+                   features = genes,
+                   reduction = "umap",
+                   ncol = 3,
+                   order = TRUE) +  # Plot high expression on top
+    plot_annotation(title = paste0("Cluster ", clust, " Top Markers"))
+  
+  print(p)
+}
+```
+
+### Group D
+
+```{r markers-dimplot-B}
+# Top 3 markers for each cluster on UMAP
+top3_B <- markers_D %>%
+  group_by(cluster) %>%
+  top_n(n = 3, wt = avg_log2FC)
+
+# Feature plots on UMAP
+for(clust in unique(top3_D$cluster)) {
+  genes <- top3_D %>% filter(cluster == clust) %>% pull(gene)
+  
+  p <- FeaturePlot(group_D_merged, 
+                   features = genes,
+                   reduction = "umap",
+                   ncol = 3,
+                   order = TRUE) +  # Plot high expression on top
+    plot_annotation(title = paste0("Cluster ", clust, " Top Markers"))
+  
+  print(p)
+}
+```
+
+## Placenta specific markers
+
+Our cluster markers don't show good localization to clusters and other than clusters 3 and 5, clusters might be technical artifacts. Let's focus on biologically known markers instead.
+
+### Group A
+
+```{r placenta-A}
+# Placenta-specific markers
+placenta_markers <- list(
+  Trophoblast = c("CGB", "CGB3", "CGB5", "CGB7", "CSH1", "CSH2", "KRT7", "ERVW1", "PSG1"),
+  Endothelial = c("PECAM1", "VWF", "CDH5", "CD34"),
+  Stromal_Fibroblast = c("VIM", "COL1A1", "COL3A1", "DCN"),
+  Smooth_Muscle = c("ACTA2", "MYH11", "TAGLN"),
+  Immune = c("PTPRC", "CD68", "CD163", "CD3D"),
+  Hofbauer_Cells = c("CD68", "CD163", "FOLR2")  # Placental macrophages
+)
+
+# Check which are detected
+group_A_detected <- lapply(placenta_markers, function(genes) {
+  genes[genes %in% rownames(group_A_merged)]
+})
+
+print(group_A_detected)
+
+# Visualize on UMAP
+for(cell_type in names(group_A_detected)) {
+  if(length(group_A_detected[[cell_type]]) > 0) {
+    p <- FeaturePlot(group_A_merged, 
+                     features = group_A_detected[[cell_type]][1:min(4, length(group_A_detected[[cell_type]]))],
+                     reduction = "umap",
+                     ncol = 2)
+    print(p + plot_annotation(title = paste0(cell_type, " Markers")))
+  }
+}
+
+# DotPlot for all detected markers - remove duplicates
+unique_markers <- unique(unlist(group_A_detected))
+
+if(length(unique_markers) > 0) {
+  DotPlot(group_A_merged, features = unique_markers) +
+    RotatedAxis() +
+    coord_flip() +
+    ggtitle("Placental Cell Type Markers - Group A")
+} else {
+  cat("No placental markers detected in Group A\n")
+}
+```
+
+### Group D
+
+```{r placenta-D}
+# Check which are detected
+group_D_detected <- lapply(placenta_markers, function(genes) {
+  genes[genes %in% rownames(group_D_merged)]
+})
+
+print(group_D_detected)
+
+# Visualize on UMAP
+for(cell_type in names(group_D_detected)) {
+  if(length(group_D_detected[[cell_type]]) > 0) {
+    p <- FeaturePlot(group_D_merged, 
+                     features = group_D_detected[[cell_type]][1:min(4, length(group_D_detected[[cell_type]]))],
+                     reduction = "umap",
+                     ncol = 2)
+    print(p + plot_annotation(title = paste0(cell_type, " Markers")))
+  }
+}
+
+# DotPlot for all detected markers - remove duplicates
+D_unique_markers <- unique(unlist(group_D_detected))
+
+if(length(D_unique_markers) > 0) {
+  DotPlot(group_D_merged, features = D_unique_markers) +
+    RotatedAxis() +
+    coord_flip() +
+    ggtitle("Placental Cell Type Markers - Group D")
+} else {
+  cat("No placental markers detected in Group D\n")
+}
 ```
 
 ---
@@ -851,6 +988,14 @@ cat("Marker visualizations saved to Cluster_Markers_Visualization.pdf\n")
 ## Merge All Samples for Group Comparison
 
 ```{r merge-all-samples}
+rds_file_all <- "../results/All_Samples_Merged_Spatial.rds"
+
+if(file.exists(rds_file_all)) {
+  cat("Loading existing all-samples merged object from disk...\n")
+  all_samples_merged <- readRDS(rds_file_all)
+  cat(paste0("  Loaded ", ncol(all_samples_merged), " spots\n"))
+} else {
+  
 cat("\n")
 cat(strrep("=", 80), "\n")
 cat("DIFFERENTIAL EXPRESSION: GROUP A vs GROUP D\n")
@@ -862,412 +1007,153 @@ cat("compositional differences rather than true gene expression changes.n\n")
 
 cat("Merging all samples for group comparison...\n")
 
-all_samples_merged <- merge(x = spatial_filtered[[1]],
-                            y = spatial_filtered[-1],
-                            add.cell.ids = names(spatial_filtered),
-                            project = "All_Samples")
-
-# Add group assignment
-all_samples_merged$group <- ifelse(grepl("^A", all_samples_merged$sample_id), 
-                                   "Group_A", "Group_D")
-
-cat(paste0("  Total spots: ", ncol(all_samples_merged), "\n"))
-cat(paste0("  Group A spots: ", sum(all_samples_merged$group == "Group_A"), "\n"))
-cat(paste0("  Group D spots: ", sum(all_samples_merged$group == "Group_D"), "\n\n"))
-
-# Re-normalize merged dataset
-cat("Re-normalizing merged dataset...\n")
+# Don't regress sample_id - only regress percent.mt
 all_samples_merged <- SCTransform(all_samples_merged, 
                                   assay = "Spatial",
-                                  vars.to.regress = c("percent.mt", "sample_id"),
+                                  vars.to.regress = "percent.mt",  # Removed sample_id
                                   verbose = FALSE)
 
 all_samples_merged <- RunPCA(all_samples_merged, assay = "SCT", npcs = 50, verbose = FALSE)
-all_samples_merged <- RunUMAP(all_samples_merged, reduction = "PCA", dims = 1:30, verbose = FALSE)
-all_samples_merged <- FindNeighbors(all_samples_merged, reduction = "PCA", dims = 1:30, verbose = FALSE)
+
+# Use Harmony for batch correction
+library(harmony)
+all_samples_merged <- RunHarmony(all_samples_merged, 
+                                 group.by.vars = "sample_id",
+                                 dims = 1:30,
+                                 verbose = FALSE)
+
+# Use harmony reduction for downstream analysis
+all_samples_merged <- RunUMAP(all_samples_merged, reduction = "harmony", dims = 1:30, verbose = FALSE)
+all_samples_merged <- FindNeighbors(all_samples_merged, reduction = "harmony", dims = 1:30, verbose = FALSE)
 all_samples_merged <- FindClusters(all_samples_merged, resolution = 0.5, verbose = FALSE)
-
-cat("Merged dataset processed.n\n")
-```
-
-## Find Differentially Expressed Genes
-
-```{r find-degs}
-cat("Finding differentially expressed genes between groups...\n")
-Idents(all_samples_merged) <- "group"
-
-group_degs <- FindMarkers(all_samples_merged,
-                          ident.1 = "Group_A",
-                          ident.2 = "Group_D",
-                          test.use = "wilcox",
-                          logfc.threshold = 0.25,
-                          min.pct = 0.1,
-                          verbose = FALSE)
-
-# Add gene names and filter for significance
-group_degs$gene <- rownames(group_degs)
-group_degs_sig <- group_degs %>%
-  filter(p_val_adj < 0.05) %>%
-  arrange(desc(abs(avg_log2FC)))
-
-write.csv(group_degs_sig, "Group_A_vs_D_DEGs_significant.csv", row.names = FALSE)
-write.csv(group_degs, "Group_A_vs_D_DEGs_all.csv", row.names = FALSE)
-
-cat(paste0("  Total significant DEGs (FDR < 0.05): ", nrow(group_degs_sig), "\n"))
-if(nrow(group_degs_sig) > 0) {
-  cat(paste0("  Upregulated in Group A: ", sum(group_degs_sig$avg_log2FC > 0), "\n"))
-  cat(paste0("  Upregulated in Group D: ", sum(group_degs_sig$avg_log2FC < 0), "\n"))
-}
-cat("  Results saved to Group_A_vs_D_DEGs_significant.csvn\n")
-```
-
-## Top DEGs
-
-```{r deg-table}
-if(nrow(group_degs_sig) > 0) {
-  top20_degs <- head(group_degs_sig, 20)
-  
-  kable(top20_degs %>% 
-          select(gene, avg_log2FC, pct.1, pct.2, p_val_adj) %>%
-          mutate(Direction = ifelse(avg_log2FC > 0, "Group A", "Group D")), 
-        digits = 3,
-        caption = "Top 20 Differentially Expressed Genes",
-        col.names = c("Gene", "Log2FC", "Pct.1 (A)", "Pct.2 (D)", "Adj. P-value", "Higher in")) %>%
-    kable_styling(bootstrap_options = c("striped", "hover"))
-} else {
-  cat("**No significant DEGs found between groups at FDR < 0.05**n\n")
-  cat("This may indicate:\n")
-  cat("- Similar biological states between groups\n")
-  cat("- High variability within groups\n")
-  cat("- Insufficient power due to sample quality\n")
+saveRDS(all_samples_merged, "../results/All_Samples_Merged_Spatial.rds")
+saveRDS(all_samples_merged, file = rds_file_all)
+  cat("All samples merged and processed.\n")
 }
 ```
+
+## Pseudobulk Differential Expression Analysis
+
+### Rationale
+
+**Why Clusters 3 and 5?**
+
+During cluster marker analysis, only clusters 3 and 5 showed biologically meaningful, cluster-specific gene expression patterns. The other clusters appear to be driven by technical artifacts (sample quality differences, degradation patterns) rather than distinct cell populations. Therefore, we focus differential expression analysis on these two biologically interpretable clusters.
+
+**Why Pseudobulk?**
+
+Pseudobulk aggregation treats each biological sample as a replicate (rather than each individual spot), which:
+- Provides appropriate statistical inference at the sample level
+- Accounts for within-sample correlation of spots
+- Follows current best practices for multi-sample spatial/single-cell analysis
+- Allows use of edgeR's robust statistical framework designed for biological replicates
+
+**Samples Included:**
+- Group A: A3, A4 (n=2)
+- Group D: D1, D3, D4 (n=3)
+
+Samples A1, A2, and D2 were excluded due to severe quality issues (low UMI counts, poor mapping rates).
 
 ---
 
-# Part 13: DEG Visualizations
+```{r pseudobulk-degs}
+library(edgeR)
 
-```{r deg-viz, fig.width=14, fig.height=10}
-if(nrow(group_degs_sig) > 0) {
-  cat("Generating DEG visualization plots...\n")
+# Subset to quality-filtered samples
+samples_to_use <- c("A3", "A4", "D1", "D3", "D4")
+all_samples_subset <- subset(all_samples_merged, subset = sample_id %in% samples_to_use)
+
+cat(paste0("Analyzing ", ncol(all_samples_subset), " spots from ", 
+           length(samples_to_use), " samples\n\n"))
+
+# Join layers (Seurat v5 requirement)
+all_samples_subset[["Spatial"]] <- JoinLayers(all_samples_subset[["Spatial"]])
+
+# Function to run pseudobulk DE for a cluster
+run_pseudobulk_de <- function(seurat_obj, cluster_id, cluster_name) {
   
-# Volcano plot
-  p_volcano <- ggplot(group_degs, aes(x = avg_log2FC, y = -log10(p_val_adj))) +
-    geom_point(aes(color = p_val_adj < 0.05 & abs(avg_log2FC) > 0.5), 
-               alpha = 0.6, size = 1) +
-    scale_color_manual(values = c("grey70", "red3"), 
-                       labels = c("Not Significant", "Significant")) +
-    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "blue") +
-    geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed", color = "blue") +
-    labs(title = "Differential Expression: Group A vs D",
-         x = "Log2 Fold Change (positive = higher in A)", 
-         y = "-Log10(Adjusted P-value)",
-         color = "Significance") +
-    theme_minimal() +
-    theme(legend.position = "bottom")
+  cat(strrep("=", 60), "\n")
+  cat(paste0("CLUSTER ", cluster_id, ": ", cluster_name, "\n"))
+  cat(strrep("=", 60), "\n\n")
   
-  print(p_volcano)
+  # Subset to cluster
+  cluster_obj <- subset(seurat_obj, subset = seurat_clusters == cluster_id)
   
- # Top DEGs heatmap
-  if(nrow(group_degs_sig) >= 20) {
-    top_degs <- group_degs_sig %>% top_n(n = 20, wt = abs(avg_log2FC))
-    
-    p_heatmap <- DoHeatmap(all_samples_merged, 
-                           features = top_degs$gene,
-                           group.by = "group",
-                           size = 3) +
-      ggtitle("Top 20 DEGs: Group A vs D")
-    
-    print(p_heatmap)
-  }
+  cat(paste0("Total spots: ", ncol(cluster_obj), "\n"))
+  cat(paste0("  Group A: ", sum(cluster_obj$group == "Group_A"), "\n"))
+  cat(paste0("  Group D: ", sum(cluster_obj$group == "Group_D"), "\n\n"))
   
-# Feature plots for top DEGs
-  top5_A <- group_degs_sig %>% 
-    filter(avg_log2FC > 0) %>% 
-    top_n(n = 5, wt = avg_log2FC)
+  # Aggregate to pseudobulk (one value per sample)
+  pseudo_obj <- AggregateExpression(cluster_obj,
+                                    assays = "Spatial",
+                                    return.seurat = TRUE,
+                                    group.by = c("sample_id", "seurat_clusters"))
   
-  top5_D <- group_degs_sig %>% 
-    filter(avg_log2FC < 0) %>% 
-    top_n(n = 5, wt = -avg_log2FC)
+  # Add group metadata
+  pseudo_obj$group <- ifelse(pseudo_obj$sample_id %in% c("A3", "A4"), 
+                             "Group_A", "Group_D")
   
-  if(nrow(top5_A) > 0 & nrow(top5_D) > 0) {
-  # UMAP feature plots
-    genes_to_plot <- c(head(top5_A$gene, 4), head(top5_D$gene, 4))
-    
-    p_features <- FeaturePlot(all_samples_merged, 
-                              features = genes_to_plot,
-                              reduction = "umap",
-                              ncol = 4)
-    print(p_features)
-    
-  # Violin plots comparing groups
-    genes_to_vln <- c(head(top5_A$gene, 3), head(top5_D$gene, 3))
-    
-    p_vln_compare <- VlnPlot(all_samples_merged,
-                             features = genes_to_vln,
-                             group.by = "group",
-                             ncol = 3,
-                             pt.size = 0)
-    print(p_vln_compare)
-  }
+  cat("Pseudobulk samples:\n")
+  print(table(pseudo_obj$group))
+  cat("\n")
   
-  cat("DEG visualizations complete.\n")
-} else {
-  cat("No significant DEGs to visualize.\n")
-}
-```
-
----
-
-# Part 14: Save Final Objects and Results
-
-```{r save-final}
-# Save final merged object
-saveRDS(all_samples_merged, "All_Samples_Merged_Spatial.rds")
-
-cat("All analysis objects saved successfully.\n")
-```
-
----
-
-# Analysis Summary
-
-```{r final-summary, results='asis'}
-cat("\n")
-cat(strrep("=", 80), "\n")
-cat("ANALYSIS COMPLETE\n")
-cat(strrep("=", 80), "\n\n")
-
-cat("## Saved Objectsn\n")
-cat("**Individual samples:**\n")
-for(sample_id in names(spatial_filtered)) {
-  cat(paste0("- Filtered_", sample_id, "_Spatial.rds\n"))
-}
-cat("\n**Merged objects:**\n")
-cat("- Group_A_Merged_Spatial.rds\n")
-cat("- Group_D_Merged_Spatial.rds\n")
-cat("- All_Samples_Merged_Spatial.rdsn\n")
-
-cat("## Saved Resultsn\n")
-cat("- QC_Filtering_Summary.csv\n")
-cat("- Group_A_Cluster_Markers.csv\n")
-cat("- Group_A_Top10_Markers.csv\n")
-cat("- Group_D_Cluster_Markers.csv\n")
-cat("- Group_D_Top10_Markers.csv\n")
-if(exists("group_degs_sig")) {
-  cat("- Group_A_vs_D_DEGs_significant.csv\n")
-  cat("- Group_A_vs_D_DEGs_all.csv\n")
-}
-cat("\n")
-
-cat("## Generated Plotsn\n")
-cat("- Cluster_Markers_Visualization.pdf\n")
-cat("- Various inline plots in this HTML reportn\n")
-
-cat("## Summary Statisticsn\n")
-
-cat("**QC Filtering:**\n")
-cat(paste0("- Total spots before QC: ", format(sum(qc_summary$Spots_Before), big.mark = ","), "\n"))
-cat(paste0("- Total spots after QC: ", format(sum(qc_summary$Spots_After), big.mark = ","), "\n"))
-cat(paste0("- Overall retention rate: ", round(mean(qc_summary$Percent_Retained), 1), "%n\n"))
-
-cat("**Clustering:**\n")
-cat(paste0("- Group A clusters: ", length(unique(group_A_merged$seurat_clusters)), "\n"))
-cat(paste0("- Group D clusters: ", length(unique(group_D_merged$seurat_clusters)), "\n\n"))
-
-cat("**Marker Genes:**\n")
-if(exists("markers_A")) {
-  cat(paste0("- Group A markers identified: ", nrow(markers_A), "\n"))
-}
-if(exists("markers_D")) {
-  cat(paste0("- Group D markers identified: ", nrow(markers_D), "\n"))
-}
-cat("\n")
-
-cat("**Differential Expression:**\n")
-if(exists("group_degs_sig")) {
-  if(nrow(group_degs_sig) > 0) {
-    cat(paste0("- Significant DEGs (FDR < 0.05): ", nrow(group_degs_sig), "\n"))
-    cat(paste0("- Upregulated in Group A: ", sum(group_degs_sig$avg_log2FC > 0), "\n"))
-    cat(paste0("- Upregulated in Group D: ", sum(group_degs_sig$avg_log2FC < 0), "\n"))
+  # Extract counts and create design
+  counts_matrix <- GetAssayData(pseudo_obj, assay = "Spatial", slot = "counts")
+  group_factor <- factor(pseudo_obj$group, levels = c("Group_A", "Group_D"))
+  design_matrix <- model.matrix(~group_factor)
+  
+  # edgeR analysis
+  dge_list <- DGEList(counts = counts_matrix, group = group_factor)
+  dge_list <- calcNormFactors(dge_list)
+  dge_list <- estimateDisp(dge_list, design_matrix)
+  fit_obj <- glmQLFit(dge_list, design_matrix)
+  test_obj <- glmQLFTest(fit_obj, coef = 2)
+  
+  # Get all results
+  results_all <- topTags(test_obj, n = Inf)$table
+  results_all$gene <- rownames(results_all)
+  
+  # Filter significant
+  results_sig <- results_all %>%
+    filter(FDR < 0.05) %>%
+    arrange(desc(abs(logFC)))
+  
+  # Report results
+  cat(paste0("Total DEGs (FDR < 0.05): ", nrow(results_sig), "\n"))
+  if(nrow(results_sig) > 0) {
+    cat(paste0("  Upregulated in Group A: ", sum(results_sig$logFC > 0), "\n"))
+    cat(paste0("  Upregulated in Group D: ", sum(results_sig$logFC < 0), "\n\n"))
   } else {
-    cat("- No significant DEGs found between groups\n")
+    cat("  No significant DEGs found\n\n")
   }
-}
-cat("\n")
-
-cat(strrep("=", 80), "\n\n")
-```
-
----
-
-# Key Findings and Interpretations
-
-```{r key-findings, results='asis'}
-cat("## Quality Assessmentn\n")
-
-# Assess overall sample quality
-poor_samples <- qc_summary %>% filter(Median_UMI_After < 500)
-marginal_samples <- qc_summary %>% filter(Median_UMI_After >= 500 & Median_UMI_After < 1000)
-good_samples <- qc_summary %>% filter(Median_UMI_After >= 1000)
-
-if(nrow(poor_samples) > 0) {
-  cat("**Samples with poor quality (Median UMI < 500):**n\n")
-  for(i in 1:nrow(poor_samples)) {
-    cat(paste0("- ", poor_samples$Sample[i], ": ", poor_samples$Median_UMI_After[i], " UMI/spot\n"))
-  }
-  cat("\nThese samples have severe FFPE degradation. Results should be interpreted with extreme caution.n\n")
-}
-
-if(nrow(marginal_samples) > 0) {
-  cat("**Samples with marginal quality (Median UMI 500-1000):**n\n")
-  for(i in 1:nrow(marginal_samples)) {
-    cat(paste0("- ", marginal_samples$Sample[i], ": ", marginal_samples$Median_UMI_After[i], " UMI/spot\n"))
-  }
-  cat("\nThese samples are usable but below optimal FFPE standards. Consider as exploratory.n\n")
-}
-
-if(nrow(good_samples) > 0) {
-  cat("**Samples with acceptable quality (Median UMI >= 1000):**n\n")
-  for(i in 1:nrow(good_samples)) {
-    cat(paste0("- ", good_samples$Sample[i], ": ", good_samples$Median_UMI_After[i], " UMI/spot\n"))
-  }
-  cat("\nThese samples are suitable for analysis with standard caveats for FFPE data.n\n")
-}
-
-cat("## Batch Effectsn\n")
-
-# Summarize batch assessment
-if(exists("batch_A") && exists("batch_D")) {
-  sig_pcs_A <- sum(batch_A$pc_pvalues < 0.05)
-  sig_pcs_D <- sum(batch_D$pc_pvalues < 0.05)
   
-  cat(paste0("- Group A: ", sig_pcs_A, " PCs significantly associated with sample\n"))
-  cat(paste0("- Group D: ", sig_pcs_D, " PCs significantly associated with samplen\n"))
+  # Save full results
+  filename_all <- paste0("../results/Pseudobulk_Cluster", cluster_id, "_AllGenes.csv")
+  filename_sig <- paste0("../results/Pseudobulk_Cluster", cluster_id, "_SignificantDEGs.csv")
   
-  if(sig_pcs_A >= 5 | sig_pcs_D >= 5) {
-    cat("**Strong batch effects detected.** Consider:\n")
-    cat("- Harmony integration for batch correction\n")
-    cat("- Including sample as covariate in DEG analysis\n")
-    cat("- Validating key findings across multiple samplesn\n")
-  } else if(sig_pcs_A >= 2 | sig_pcs_D >= 2) {
-    cat("**Moderate batch effects present.** Results are usable but interpret cluster composition carefully.n\n")
-  } else {
-    cat("**Minimal batch effects.** Sample integration appears successful.n\n")
-  }
+  write.csv(results_all, filename_all, row.names = FALSE)
+  write.csv(results_sig, filename_sig, row.names = FALSE)
+  
+  cat(paste0("Results saved:\n"))
+  cat(paste0("  - ", filename_all, " (all genes)\n"))
+  cat(paste0("  - ", filename_sig, " (FDR < 0.05 only)\n\n"))
+  
+  return(list(all = results_all, significant = results_sig))
 }
 
-cat("## Biological Interpretationn\n")
+# Run analysis for both clusters
+degs_cluster3 <- run_pseudobulk_de(all_samples_subset, 
+                                   cluster_id = 3, 
+                                   cluster_name = "Biologically Meaningful Cluster 1")
 
-if(exists("group_degs_sig") && nrow(group_degs_sig) > 0) {
-  cat("Differential expression analysis identified significant differences between Group A and Group D.n\n")
-  cat("**Next steps for interpretation:**\n")
-  cat("1. Perform pathway enrichment analysis (e.g., GO, KEGG) on DEGs\n")
-  cat("2. Validate top DEGs with spatial feature plots\n")
-  cat("3. Check if DEGs localize to specific tissue regions\n")
-  cat("4. Compare findings to published literature for your tissue typen\n")
-} else {
-  cat("No significant DEGs found between groups. This could indicate:\n")
-  cat("- Biological similarity between conditions\n")
-  cat("- High within-group variability masking differences\n")
-  cat("- Insufficient statistical power due to sample quality\n")
-  cat("- Technical noise overwhelming biological signaln\n")
-  cat("Consider cluster-specific comparisons or focus on spatial patterns.n\n")
-}
+degs_cluster5 <- run_pseudobulk_de(all_samples_subset, 
+                                   cluster_id = 5, 
+                                   cluster_name = "Biologically Meaningful Cluster 2")
+
+cat(strrep("=", 60), "\n")
+cat("PSEUDOBULK ANALYSIS COMPLETE\n")
+cat(strrep("=", 60), "\n")
 ```
-
----
-
-# Recommendations and Next Steps
-
-## Immediate Actions
-
-1. **Review visualizations carefully**
-   - Check UMAP plots for sample-specific clustering (batch effects)
-   - Verify spatial patterns make biological sense
-   - Identify any unexpected patterns or artifacts
-
-2. **Validate key findings**
-   - Use `SpatialFeaturePlot()` to examine top DEGs spatially
-   - Check if marker genes match expected cell types
-   - Compare results to published data for your tissue type
-
-3. **Address batch effects if needed**
-   - If strong batch effects detected, run Harmony integration:
-   
-```r
-# Uncomment to run Harmony
-# library(harmony)
-# group_A_harmony <- RunHarmony(group_A_merged, group.by.vars = "sample_id")
-# group_D_harmony <- RunHarmony(group_D_merged, group.by.vars = "sample_id")
-```
-
-## Additional Analyses
-
-### 1. Cell Type Annotation
-
-Use known marker genes to annotate clusters:
-
-```r
-# Example markers for common cell types
-# epithelial_markers <- c("KRT8", "KRT18", "EPCAM")
-# immune_markers <- c("PTPRC", "CD3D", "CD68")
-# stromal_markers <- c("COL1A1", "VIM", "ACTA2")
-```
-
-### 2. Pathway Enrichment
-
-```r
-# Example using clusterProfiler
-# library(clusterProfiler)
-# library(org.Hs.eg.db)
-# 
-# ego <- enrichGO(gene = deg_genes,
-#                 OrgDb = org.Hs.eg.db,
-#                 ont = "BP",
-#                 pAdjustMethod = "BH",
-#                 qvalueCutoff = 0.05)
-```
-
-### 3. Spatially Variable Genes
-
-```r
-# Find genes with spatial patterns
-# spatial_features <- FindSpatiallyVariableFeatures(obj,
-#                                                    assay = "SCT",
-#                                                    selection.method = "moransi")
-```
-
-### 4. Cell-Cell Communication Analysis
-
-```r
-# Example using CellChat or similar tools
-# Identify spatially co-localized cell types
-# Infer ligand-receptor interactions
-```
-
-## Experimental Recommendations
-
-For future FFPE spatial experiments:
-
-1. **Tissue Processing**
-   - Minimize fixation time (<24 hours optimal)
-   - Ensure complete deparaffinization
-   - Optimize protease digestion
-
-2. **Quality Control**
-   - Process samples in randomized batches
-   - Include positive control tissue
-   - Monitor storage conditions
-
-3. **Sample Selection**
-   - Use recent FFPE blocks (<2 years old)
-   - Avoid over-fixed samples
-   - Request fresh frozen backup if possible
-
-4. **Sequencing Depth**
-   - Target 40,000-50,000 reads/spot for FFPE
-   - Higher depth needed than fresh frozen
 
 ---
 
