@@ -1,0 +1,1286 @@
+---
+title: "10x Visium FFPE Spatial Transcriptomics Analysis"
+author: "Spatial Analysis Pipeline"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, 
+                      fig.width = 12, fig.height = 8)
+```
+
+# Overview
+
+This pipeline performs spatial transcriptomics analysis of 10x Visium FFPE samples using **standard Seurat QC filtering practices**. 
+
+**Samples:** 8 total (Groups A and D, n=4 each)
+
+**Quality Note:** These samples show FFPE-related quality challenges including low UMI counts and variable mapping rates. We use standard Seurat QC thresholds rather than complex adaptive filtering because:
+
+1. **Elaborate filtering doesn't fix intrinsic FFPE degradation** - our initial tests showed minimal improvement
+2. **Standard practices are reproducible and well-validated** - following Seurat documentation and community standards
+3. **Simple thresholds are transparent** - easy to understand and justify
+4. **We're not reinventing the wheel** - using established 10x Genomics and Seurat recommendations
+
+**Standard QC approach:**
+- Remove spots with <200 genes (likely empty or failed)
+- Remove spots with >25% mitochondrial content (dead/dying cells)
+- Remove extreme outliers (>99th percentile)
+
+This is honest science: we acknowledge sample limitations and analyze what we have with appropriate caveats.
+
+---
+
+# Load Libraries
+
+```{r load-libraries}
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+```
+
+---
+
+# Part 1: Load Samples and Calculate QC Metrics
+
+```{r load-samples}
+# Define sample information
+sample_paths <- data.frame(
+  sample_id = c("A1", "A2", "A3", "A4", "D1", "D2", "D3", "D4"),
+  path = c("A1_AM_Spatial_Seq", "A2_AM_Spatial_Seq", "A3_AM_Spatial_Seq", "A4_AM_Spatial_Seq",
+           "D1_AM_Spatial_Seq", "D2_AM_Spatial_Seq", "D3_AM_Spatial_Seq", "D4_AM_Spatial_Seq"),
+  group = c(rep("A", 4), rep("D", 4)),
+  stringsAsFactors = FALSE
+)
+
+cat("Loading spatial samples...\n")
+spatial_list <- list()
+
+for(i in 1:nrow(sample_paths)) {
+  sample_id <- sample_paths$sample_id[i]
+  sample_path <- sample_paths$path[i]
+  
+  cat(paste0("  Loading ", sample_id, "...\n"))
+  
+  tryCatch({
+  # Load spatial data
+    obj <- Load10X_Spatial(
+      data.dir = paste0("/orange/cancercenter-dept/JONES/AM_10x_Visium_v2/SpaceRanger_Output_and_Scripts/",
+                        sample_path, "/outs"),
+      filename = "filtered_feature_bc_matrix.h5"
+    )
+    
+  # Add sample metadata
+    obj$sample_id <- sample_id
+    obj$group <- sample_paths$group[i]
+    
+  # Calculate QC metrics
+    obj$percent.mt <- PercentageFeatureSet(obj, pattern = "^MT-")
+    obj$percent.ribo <- PercentageFeatureSet(obj, pattern = "^RP[SL]")
+    
+  # Handle NA values (spots with no MT genes)
+    obj$percent.mt[is.na(obj$percent.mt)] <- 0
+    obj$percent.ribo[is.na(obj$percent.ribo)] <- 0
+    
+    spatial_list[[sample_id]] <- obj
+    cat(paste0("    Loaded ", ncol(obj), " spots\n"))
+    
+  }, error = function(e) {
+    cat(paste0("    ERROR: ", e$message, "\n"))
+  })
+}
+
+cat(paste0("\nSuccessfully loaded ", length(spatial_list), " samples\n"))
+```
+
+---
+
+# Part 2: Pre-QC Visualization
+
+```{r pre-qc-summary}
+# Create summary of pre-QC metrics
+pre_qc_summary <- data.frame()
+
+for(sample_id in names(spatial_list)) {
+  obj <- spatial_list[[sample_id]]
+  
+  pre_qc_summary <- rbind(pre_qc_summary, data.frame(
+    Sample = sample_id,
+    Group = unique(obj$group),
+    Total_Spots = ncol(obj),
+    Median_UMI = median(obj$nCount_Spatial),
+    Median_Genes = median(obj$nFeature_Spatial),
+    Mean_MT_Percent = round(mean(obj$percent.mt), 2),
+    Spots_Low_Genes = sum(obj$nFeature_Spatial < 200),
+    Spots_High_MT = sum(obj$percent.mt > 25)
+  ))
+}
+
+kable(pre_qc_summary, 
+      caption = "Pre-QC Summary Statistics") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+```{r pre-qc-plots, fig.width=14, fig.height=10}
+# Generate pre-QC violin plots for all samples
+for(sample_id in names(spatial_list)) {
+  obj <- spatial_list[[sample_id]]
+  
+  p <- VlnPlot(obj, 
+               features = c("nCount_Spatial", "nFeature_Spatial", "percent.mt"),
+               ncol = 3, 
+               pt.size = 0.1) +
+    plot_annotation(title = paste0(sample_id, " - Pre-QC Metrics"))
+  
+  print(p)
+}
+```
+
+---
+
+# Part 3: Standard Seurat QC Filtering
+
+## Filtering Rationale
+
+We apply **standard Seurat QC thresholds** used widely in spatial transcriptomics:
+
+**Filter 1: Minimum gene threshold (>200 genes)**
+- **Purpose:** Remove empty spots, failed capture spots, or spots with insufficient RNA
+- **Biological basis:** Spots with <200 genes lack sufficient complexity for meaningful analysis
+- **Reference:** Standard Seurat filtering (Butler et al. 2018, Nature Biotechnology)
+
+**Filter 2: Mitochondrial percentage threshold (<25%)**
+- **Purpose:** Remove dead/dying cells with compromised cell membranes
+- **Biological basis:** High MT% indicates cytoplasmic RNA loss with preserved mitochondrial RNA
+- **FFPE consideration:** We use 25% (more permissive than 15-20% for fresh tissue) because FFPE can have higher background
+- **Reference:** 10x Genomics technical notes for FFPE samples
+
+**Filter 3: Remove extreme outliers (>99th percentile)**
+- **Purpose:** Remove doublets, artifacts, or technical anomalies
+- **Biological basis:** Spots with extreme counts likely represent technical issues
+- **Statistical basis:** Outliers beyond 99th percentile are often non-biological
+
+```{r standard-qc-filtering}
+cat("\n")
+cat(strrep("=", 80), "\n")
+cat("APPLYING STANDARD SEURAT QC FILTERING\n")
+cat(strrep("=", 80), "\n\n")
+
+spatial_filtered <- list()
+qc_summary <- data.frame()
+
+for(sample_id in names(spatial_list)) {
+  obj <- spatial_list[[sample_id]]
+  
+  cat(paste0("\nFiltering ", sample_id, ":\n"))
+  
+# Record pre-filter metrics
+  n_spots_before <- ncol(obj)
+  median_umi_before <- median(obj$nCount_Spatial)
+  median_genes_before <- median(obj$nFeature_Spatial)
+  mean_mt_before <- mean(obj$percent.mt)
+  
+# Calculate 99th percentile threshold for this sample
+  upper_limit <- quantile(obj$nFeature_Spatial, 0.99)
+  
+  cat(paste0("  Initial spots: ", n_spots_before, "\n"))
+  cat(paste0("  Thresholds:\n"))
+  cat(paste0("    - Minimum genes: 200\n"))
+  cat(paste0("    - Maximum MT%: 25%\n"))
+  cat(paste0("    - Upper gene limit (99th percentile): ", round(upper_limit, 0), "\n"))
+  
+# Apply standard Seurat QC filtering
+  obj_filtered <- subset(obj, 
+                         subset = nFeature_Spatial > 200 & 
+                                 nFeature_Spatial < upper_limit &
+                                 percent.mt < 25)
+  
+# Record post-filter metrics
+  n_spots_after <- ncol(obj_filtered)
+  n_removed <- n_spots_before - n_spots_after
+  pct_retained <- round(100 * n_spots_after / n_spots_before, 1)
+  median_umi_after <- median(obj_filtered$nCount_Spatial)
+  median_genes_after <- median(obj_filtered$nFeature_Spatial)
+  mean_mt_after <- mean(obj_filtered$percent.mt)
+  
+  cat(paste0("  Spots retained: ", n_spots_after, " (", pct_retained, "%)\n"))
+  cat(paste0("  Spots removed: ", n_removed, " (", round(100 - pct_retained, 1), "%)\n"))
+  
+# Store filtered object
+  spatial_filtered[[sample_id]] <- obj_filtered
+  
+# Store summary
+  qc_summary <- rbind(qc_summary, data.frame(
+    Sample = sample_id,
+    Group = unique(obj$group),
+    Spots_Before = n_spots_before,
+    Spots_After = n_spots_after,
+    Spots_Removed = n_removed,
+    Percent_Retained = pct_retained,
+    Median_UMI_Before = median_umi_before,
+    Median_UMI_After = median_umi_after,
+    Median_Genes_Before = median_genes_before,
+    Median_Genes_After = median_genes_after,
+    Mean_MT_Before = round(mean_mt_before, 2),
+    Mean_MT_After = round(mean_mt_after, 2)
+  ))
+}
+
+cat("\n")
+cat(strrep("=", 80), "\n")
+cat("QC FILTERING COMPLETE\n")
+cat(strrep("=", 80), "\n\n")
+```
+
+## QC Filtering Summary
+
+```{r qc-summary-table}
+kable(qc_summary, 
+      caption = "QC Filtering Results - All Samples",
+      digits = 1) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), 
+                font_size = 11) %>%
+  scroll_box(width = "100%")
+
+# Save summary
+write.csv(qc_summary, "../results/QC_Filtering_Summary.csv", row.names = FALSE)
+
+cat("\nQC summary saved to QC_Filtering_Summary.csv\n")
+```
+
+## Key Observations
+
+```{r qc-observations, results='asis'}
+# Calculate overall statistics
+total_spots_before <- sum(qc_summary$Spots_Before)
+total_spots_after <- sum(qc_summary$Spots_After)
+overall_retention <- round(100 * total_spots_after / total_spots_before, 1)
+avg_retention <- round(mean(qc_summary$Percent_Retained), 1)
+
+cat(paste0("- **Total spots before QC:** ", format(total_spots_before, big.mark = ","), "\n"))
+cat(paste0("- **Total spots after QC:** ", format(total_spots_after, big.mark = ","), "\n"))
+cat(paste0("- **Overall retention rate:** ", overall_retention, "%\n"))
+cat(paste0("- **Average retention per sample:** ", avg_retention, "%\n\n"))
+
+# Identify samples with high removal rates
+high_removal <- qc_summary %>% filter(Percent_Retained < 85)
+
+if(nrow(high_removal) > 0) {
+  cat("**Samples with >15% spot removal:**\n\n")
+  for(i in 1:nrow(high_removal)) {
+    cat(paste0("- ", high_removal$Sample[i], ": ", high_removal$Percent_Retained[i], 
+               "% retained (removed ", high_removal$Spots_Removed[i], " spots)\n"))
+  }
+  cat("\n")
+}
+
+# Check if filtering improved metrics
+improved <- qc_summary %>% 
+  mutate(UMI_Improvement = Median_UMI_After - Median_UMI_Before) %>%
+  filter(UMI_Improvement > 10)
+
+if(nrow(improved) > 0) {
+  cat("**Samples with notable UMI improvement (>10):**\n\n")
+  for(i in 1:nrow(improved)) {
+    cat(paste0("- ", improved$Sample[i], ": ", improved$Median_UMI_Before[i], 
+               " -> ", improved$Median_UMI_After[i], " (+", 
+               round(improved$UMI_Improvement[i], 0), ")\n"))
+  }
+} else {
+  cat("**Note:** Filtering did not substantially improve median UMI counts. This indicates that low quality is **sample-wide** (FFPE degradation), not due to outlier spots. The samples are usable but have intrinsic limitations.\n")
+}
+```
+
+---
+
+# Part 4: Post-QC Visualization
+
+```{r post-qc-plots, fig.width=14, fig.height=10}
+cat("Generating post-QC visualizations...\n")
+
+for(sample_id in names(spatial_filtered)) {
+  obj <- spatial_filtered[[sample_id]]
+  
+# Violin plots
+  p1 <- VlnPlot(obj, 
+                features = c("nCount_Spatial", "nFeature_Spatial", "percent.mt"),
+                ncol = 3, 
+                pt.size = 0.1) +
+    plot_annotation(title = paste0(sample_id, " - Post-QC Metrics"))
+  
+  print(p1)
+  
+# Spatial feature plots
+  p2 <- SpatialFeaturePlot(obj, features = "nCount_Spatial") + 
+    ggtitle(paste0(sample_id, " - UMI Counts"))
+  p3 <- SpatialFeaturePlot(obj, features = "nFeature_Spatial") + 
+    ggtitle(paste0(sample_id, " - Gene Counts"))
+  p4 <- SpatialFeaturePlot(obj, features = "percent.mt") + 
+    ggtitle(paste0(sample_id, " - Mitochondrial %"))
+  
+  print((p2 | p3) / p4)
+}
+```
+
+---
+
+# Part 5: Normalization and Dimensionality Reduction
+
+## SCTransform Normalization
+
+We use **SCTransform** (Hafemeister & Satija 2019, Genome Biology) for normalization because:
+
+1. Accounts for sequencing depth differences between spots
+2. Stabilizes variance across expression levels
+3. Regresses out unwanted sources of variation (MT%)
+4. Recommended for spatial transcriptomics data
+
+```{r normalize-samples}
+cat("Normalizing and processing samples...\n")
+
+for(sample_id in names(spatial_filtered)) {
+  cat(paste0("  Processing ", sample_id, "...\n"))
+  
+  obj <- spatial_filtered[[sample_id]]
+  
+# SCTransform normalization
+  obj <- SCTransform(obj, 
+                     assay = "Spatial", 
+                     vars.to.regress = "percent.mt",
+                     verbose = FALSE)
+  
+# PCA for dimensionality reduction
+  obj <- RunPCA(obj, assay = "SCT", npcs = 50, verbose = FALSE)
+  
+# UMAP for visualization
+  obj <- RunUMAP(obj, reduction = "PCA", dims = 1:30, verbose = FALSE)
+  
+# Clustering
+  obj <- FindNeighbors(obj, reduction = "PCA", dims = 1:30, verbose = FALSE)
+  obj <- FindClusters(obj, resolution = 0.5, verbose = FALSE)
+  
+  spatial_filtered[[sample_id]] <- obj
+}
+
+cat("All samples normalized and processed.\n")
+```
+
+```{r individual-sample-viz, fig.width=12, fig.height=6}
+# Visualize individual samples
+for(sample_id in names(spatial_filtered)) {
+  obj <- spatial_filtered[[sample_id]]
+  
+  p1 <- DimPlot(obj, reduction = "umap", label = TRUE) + 
+    ggtitle(paste0(sample_id, " - UMAP Clusters"))
+  
+  p2 <- SpatialDimPlot(obj, label = TRUE, label.size = 3) + 
+    ggtitle(paste0(sample_id, " - Spatial Clusters"))
+  
+  print(p1 | p2)
+}
+```
+
+---
+
+# Part 6: Merge Samples by Group
+
+```{r merge-groups}
+cat("\n")
+cat(strrep("=", 80), "\n")
+cat("MERGING SAMPLES BY GROUP\n")
+cat(strrep("=", 80), "\n\n")
+
+# Separate samples by group
+group_A_samples <- spatial_filtered[grep("^A", names(spatial_filtered))]
+group_D_samples <- spatial_filtered[grep("^D", names(spatial_filtered))]
+
+cat(paste0("Group A samples: ", paste(names(group_A_samples), collapse = ", "), "\n"))
+cat(paste0("Group D samples: ", paste(names(group_D_samples), collapse = ", "), "\n\n"))
+```
+
+## Merge Group A
+
+```{r merge-group-A}
+cat("Merging Group A samples...\n")
+
+if(length(group_A_samples) > 0) {
+# Merge samples
+  group_A_merged <- merge(x = group_A_samples[[1]],
+                          y = group_A_samples[-1],
+                          add.cell.ids = names(group_A_samples),
+                          project = "Group_A")
+  
+  cat(paste0("  Total spots: ", ncol(group_A_merged), "\n"))
+  cat(paste0("  Total genes: ", nrow(group_A_merged), "\n\n"))
+  
+# Re-normalize merged object
+  cat("  Re-normalizing merged Group A...\n")
+  group_A_merged <- SCTransform(group_A_merged, 
+                                assay = "Spatial",
+                                vars.to.regress = c("percent.mt", "sample_id"),
+                                verbose = FALSE)
+  
+# Dimensionality reduction
+  group_A_merged <- RunPCA(group_A_merged, assay = "SCT", npcs = 50, verbose = FALSE)
+  group_A_merged <- RunUMAP(group_A_merged, reduction = "PCA", dims = 1:30, verbose = FALSE)
+  
+# Clustering
+  group_A_merged <- FindNeighbors(group_A_merged, reduction = "PCA", dims = 1:30, verbose = FALSE)
+  group_A_merged <- FindClusters(group_A_merged, resolution = 0.5, verbose = FALSE)
+  
+  cat("  Group A processing complete.n\n")
+}
+```
+
+## Merge Group D
+
+```{r merge-group-D}
+cat("Merging Group D samples...\n")
+
+if(length(group_D_samples) > 0) {
+# Merge samples
+  group_D_merged <- merge(x = group_D_samples[[1]],
+                          y = group_D_samples[-1],
+                          add.cell.ids = names(group_D_samples),
+                          project = "Group_D")
+  
+  cat(paste0("  Total spots: ", ncol(group_D_merged), "\n"))
+  cat(paste0("  Total genes: ", nrow(group_D_merged), "\n\n"))
+  
+# Re-normalize merged object
+  cat("  Re-normalizing merged Group D...\n")
+  group_D_merged <- SCTransform(group_D_merged, 
+                                assay = "Spatial",
+                                vars.to.regress = c("percent.mt", "sample_id"),
+                                verbose = FALSE)
+  
+# Dimensionality reduction
+  group_D_merged <- RunPCA(group_D_merged, assay = "SCT", npcs = 50, verbose = FALSE)
+  group_D_merged <- RunUMAP(group_D_merged, reduction = "PCA", dims = 1:30, verbose = FALSE)
+  
+# Clustering
+  group_D_merged <- FindNeighbors(group_D_merged, reduction = "PCA", dims = 1:30, verbose = FALSE)
+  group_D_merged <- FindClusters(group_D_merged, resolution = 0.5, verbose = FALSE)
+  
+  cat("  Group D processing complete.n\n")
+}
+```
+
+---
+
+# Part 7: Save Processed Objects
+
+```{r save-objects}
+cat("Saving processed objects...\n")
+
+# Save individual filtered and processed samples
+for(sample_id in names(spatial_filtered)) {
+  saveRDS(spatial_filtered[[sample_id]], 
+          file = paste0("Filtered_", sample_id, "_Spatial.rds"))
+  cat(paste0("  Saved ", sample_id, "\n"))
+}
+
+# Save merged objects
+saveRDS(group_A_merged, file = "Group_A_Merged_Spatial.rds")
+saveRDS(group_D_merged, file = "Group_D_Merged_Spatial.rds")
+
+cat("\nAll objects saved successfully.\n")
+```
+
+```{r merged-summary-stats}
+# Summary of merged objects
+summary_df <- data.frame(
+  Group = c("A", "D"),
+  Total_Spots = c(ncol(group_A_merged), ncol(group_D_merged)),
+  Total_Genes = c(nrow(group_A_merged), nrow(group_D_merged)),
+  N_Clusters = c(length(unique(group_A_merged$seurat_clusters)), 
+                 length(unique(group_D_merged$seurat_clusters))),
+  Median_UMI = c(median(group_A_merged$nCount_Spatial), 
+                 median(group_D_merged$nCount_Spatial)),
+  Median_Genes = c(median(group_A_merged$nFeature_Spatial), 
+                   median(group_D_merged$nFeature_Spatial))
+)
+
+kable(summary_df, 
+      caption = "Merged Group Summary Statistics",
+      col.names = c("Group", "Total Spots", "Total Genes", "Clusters", "Median UMI", "Median Genes")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+---
+
+# Part 8: Merged Object Visualizations
+
+```{r merged-viz, fig.width=14, fig.height=10}
+cat("Generating merged group visualizations...\n")
+
+# GROUP A VISUALIZATIONS
+cat("  Group A...\n")
+
+p1 <- DimPlot(group_A_merged, reduction = "umap", group.by = "sample_id") +
+  ggtitle("Group A - Colored by Sample") +
+  theme_minimal()
+
+p2 <- DimPlot(group_A_merged, reduction = "umap", group.by = "seurat_clusters", label = TRUE) +
+  ggtitle("Group A - Colored by Cluster") +
+  theme_minimal()
+
+print(p1 | p2)
+
+# QC metrics on UMAP
+p3 <- FeaturePlot(group_A_merged, 
+                  features = c("nCount_Spatial", "nFeature_Spatial"), 
+                  reduction = "umap", 
+                  ncol = 2)
+print(p3)
+
+# Check for batch effects
+p4 <- VlnPlot(group_A_merged, 
+              features = c("nCount_Spatial", "nFeature_Spatial"), 
+              group.by = "sample_id", 
+              pt.size = 0) +
+  ggtitle("Group A - QC Metrics by Sample (Batch Effect Check)")
+print(p4)
+
+# Cluster composition by sample
+cluster_comp_A <- table(group_A_merged$sample_id, group_A_merged$seurat_clusters)
+cluster_comp_A_pct <- prop.table(cluster_comp_A, margin = 1) * 100
+
+cluster_df_A <- as.data.frame(cluster_comp_A_pct)
+colnames(cluster_df_A) <- c("Sample", "Cluster", "Percentage")
+
+p5 <- ggplot(cluster_df_A, aes(x = Sample, y = Percentage, fill = Cluster)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Group A - Cluster Composition by Sample",
+       y = "Percentage of Spots") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(p5)
+
+# GROUP D VISUALIZATIONS
+cat("  Group D...\n")
+
+p6 <- DimPlot(group_D_merged, reduction = "umap", group.by = "sample_id") +
+  ggtitle("Group D - Colored by Sample") +
+  theme_minimal()
+
+p7 <- DimPlot(group_D_merged, reduction = "umap", group.by = "seurat_clusters", label = TRUE) +
+  ggtitle("Group D - Colored by Cluster") +
+  theme_minimal()
+
+print(p6 | p7)
+
+p8 <- FeaturePlot(group_D_merged, 
+                  features = c("nCount_Spatial", "nFeature_Spatial"), 
+                  reduction = "umap", 
+                  ncol = 2)
+print(p8)
+
+p9 <- VlnPlot(group_D_merged, 
+              features = c("nCount_Spatial", "nFeature_Spatial"), 
+              group.by = "sample_id", 
+              pt.size = 0) +
+  ggtitle("Group D - QC Metrics by Sample (Batch Effect Check)")
+print(p9)
+
+cluster_comp_D <- table(group_D_merged$sample_id, group_D_merged$seurat_clusters)
+cluster_comp_D_pct <- prop.table(cluster_comp_D, margin = 1) * 100
+
+cluster_df_D <- as.data.frame(cluster_comp_D_pct)
+colnames(cluster_df_D) <- c("Sample", "Cluster", "Percentage")
+
+p10 <- ggplot(cluster_df_D, aes(x = Sample, y = Percentage, fill = Cluster)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Group D - Cluster Composition by Sample",
+       y = "Percentage of Spots") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(p10)
+```
+
+---
+
+# Part 9: Batch Effect Assessment
+
+```{r batch-assessment}
+cat("\n")
+cat(strrep("=", 80), "\n")
+cat("BATCH EFFECT ASSESSMENT\n")
+cat(strrep("=", 80), "\n\n")
+
+assess_batch_effects <- function(seurat_obj, group_name) {
+  
+  cat(paste0("### ", group_name, "\n\n"))
+  
+# Check PC association with sample
+  pca_embeddings <- Embeddings(seurat_obj, reduction = "pca")[, 1:10]
+  sample_ids <- seurat_obj$sample_id
+  
+  pc_pvalues <- sapply(1:10, function(pc) {
+    summary(aov(pca_embeddings[, pc] ~ sample_ids))[[1]][["Pr(>F)"]][1]
+  })
+  
+  cat("**PC1-10 association with sample:**n\n")
+  for(i in 1:10) {
+    sig <- ifelse(pc_pvalues[i] < 0.001, " ***", 
+                  ifelse(pc_pvalues[i] < 0.01, " **",
+                         ifelse(pc_pvalues[i] < 0.05, " *", "")))
+    cat(paste0("- PC", i, ": p = ", formatC(pc_pvalues[i], format = "e", digits = 2), sig, "\n"))
+  }
+  
+  if(sum(pc_pvalues < 0.05) >= 5) {
+    cat("\n**WARNING:** Strong batch effects detected (>=5 PCs associated with sample)n\n")
+    cat("**Recommendations:**\n")
+    cat("- Consider Harmony integration\n")
+    cat("- Use sample_id as covariate in differential expression\n")
+    cat("- Interpret results with cautionn\n")
+  } else if(sum(pc_pvalues < 0.05) >= 2) {
+    cat("\n**CAUTION:** Moderate batch effects detected\n")
+    cat("Monitor for sample-specific clusters in downstream analysis.n\n")
+  } else {
+    cat("\n**GOOD:** Minimal batch effects detectedn\n")
+  }
+  
+# QC metrics by sample
+  qc_by_sample <- seurat_obj@meta.data %>%
+    group_by(sample_id) %>%
+    summarize(
+      N_Spots = n(),
+      Mean_UMI = round(mean(nCount_Spatial), 0),
+      Mean_Genes = round(mean(nFeature_Spatial), 0),
+      Mean_MT = round(mean(percent.mt), 2)
+    )
+  
+  cat("**QC Metrics by Sample:**n\n")
+  print(kable(qc_by_sample) %>% kable_styling())
+  cat("\n")
+  
+# Statistical tests
+  umi_test <- kruskal.test(nCount_Spatial ~ sample_id, data = seurat_obj@meta.data)
+  genes_test <- kruskal.test(nFeature_Spatial ~ sample_id, data = seurat_obj@meta.data)
+  
+  cat(paste0("**Kruskal-Wallis test for UMI differences:** p = ", 
+             formatC(umi_test$p.value, format = "e", digits = 2), "\n"))
+  cat(paste0("**Kruskal-Wallis test for gene differences:** p = ", 
+             formatC(genes_test$p.value, format = "e", digits = 2), "\n\n"))
+  
+  if(umi_test$p.value < 0.001 | genes_test$p.value < 0.001) {
+    cat("**WARNING:** Significant QC differences between samples may confound biological comparisons.n\n")
+  }
+  
+  return(list(pc_pvalues = pc_pvalues, qc_summary = qc_by_sample))
+}
+
+# Assess both groups
+batch_A <- assess_batch_effects(group_A_merged, "Group A")
+batch_D <- assess_batch_effects(group_D_merged, "Group D")
+```
+
+---
+
+# Part 10: Find Cluster Markers
+
+```{r find-markers}
+cat(strrep("=", 80), "\n")
+cat("FINDING CLUSTER MARKERS\n")
+cat(strrep("=", 80), "\n\n")
+
+# Group A markers
+cat("Finding markers for Group A clusters...\n")
+Idents(group_A_merged) <- "seurat_clusters"
+
+markers_A <- FindAllMarkers(group_A_merged, 
+                            only.pos = TRUE,
+                            min.pct = 0.25,
+                            logfc.threshold = 0.5,
+                            test.use = "wilcox",
+                            verbose = FALSE)
+
+top10_A <- markers_A %>%
+  group_by(cluster) %>%
+  top_n(n = 10, wt = avg_log2FC)
+
+write.csv(markers_A, "Group_A_Cluster_Markers.csv", row.names = FALSE)
+write.csv(top10_A, "Group_A_Top10_Markers.csv", row.names = FALSE)
+
+cat(paste0("  Found markers for ", length(unique(markers_A$cluster)), " clusters\n"))
+cat(paste0("  Total marker genes: ", nrow(markers_A), "\n"))
+cat("  Saved to Group_A_Cluster_Markers.csvn\n")
+
+# Group D markers
+cat("Finding markers for Group D clusters...\n")
+Idents(group_D_merged) <- "seurat_clusters"
+
+markers_D <- FindAllMarkers(group_D_merged, 
+                            only.pos = TRUE,
+                            min.pct = 0.25,
+                            logfc.threshold = 0.5,
+                            test.use = "wilcox",
+                            verbose = FALSE)
+
+top10_D <- markers_D %>%
+  group_by(cluster) %>%
+  top_n(n = 10, wt = avg_log2FC)
+
+write.csv(markers_D, "Group_D_Cluster_Markers.csv", row.names = FALSE)
+write.csv(top10_D, "Group_D_Top10_Markers.csv", row.names = FALSE)
+
+cat(paste0("  Found markers for ", length(unique(markers_D$cluster)), " clusters\n"))
+cat(paste0("  Total marker genes: ", nrow(markers_D), "\n"))
+cat("  Saved to Group_D_Cluster_Markers.csvn\n")
+
+cat(strrep("=", 80), "\n\n")
+```
+
+## Top Markers Preview
+
+### Group A
+
+```{r preview-markers-A}
+top3_A <- markers_A %>%
+  group_by(cluster) %>%
+  top_n(n = 3, wt = avg_log2FC) %>%
+  select(cluster, gene, avg_log2FC, pct.1, pct.2, p_val_adj)
+
+kable(top3_A, 
+      digits = 3, 
+      caption = "Top 3 Markers per Cluster - Group A") %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(height = "400px")
+```
+
+### Group D
+
+```{r preview-markers-D}
+top3_D <- markers_D %>%
+  group_by(cluster) %>%
+  top_n(n = 3, wt = avg_log2FC) %>%
+  select(cluster, gene, avg_log2FC, pct.1, pct.2, p_val_adj)
+
+kable(top3_D, 
+      digits = 3, 
+      caption = "Top 3 Markers per Cluster - Group D") %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(height = "400px")
+```
+
+---
+
+# Part 11: Visualize Cluster Markers
+
+```{r viz-markers, results='hide', fig.show='hide'}
+cat("Generating marker visualization plots...\n")
+
+pdf("Cluster_Markers_Visualization.pdf", width = 20, height = 14)
+
+# Group A - top 3 markers per cluster
+cat("  Plotting Group A markers...\n")
+top3_viz_A <- markers_A %>%
+  group_by(cluster) %>%
+  top_n(n = 3, wt = avg_log2FC)
+
+for(clust in unique(top3_viz_A$cluster)) {
+  genes <- top3_viz_A %>% filter(cluster == clust) %>% pull(gene)
+  
+  tryCatch({
+  # Spatial feature plots
+    p_spatial <- SpatialFeaturePlot(group_A_merged, 
+                                    features = genes,
+                                    ncol = 3,
+                                    pt.size.factor = 1.6) +
+      plot_annotation(title = paste0("Group A - Cluster ", clust, " Markers"))
+    
+  # Violin plots
+    p_vln <- VlnPlot(group_A_merged, features = genes, ncol = 3, pt.size = 0) +
+      plot_annotation(title = paste0("Group A - Cluster ", clust))
+    
+    print(p_spatial)
+    print(p_vln)
+  }, error = function(e) {
+    cat(paste0("    Error plotting cluster ", clust, ": ", e$message, "\n"))
+  })
+}
+
+# Group D - top 3 markers per cluster
+cat("  Plotting Group D markers...\n")
+top3_viz_D <- markers_D %>%
+  group_by(cluster) %>%
+  top_n(n = 3, wt = avg_log2FC)
+
+for(clust in unique(top3_viz_D$cluster)) {
+  genes <- top3_viz_D %>% filter(cluster == clust) %>% pull(gene)
+  
+  tryCatch({
+    p_spatial <- SpatialFeaturePlot(group_D_merged, 
+                                    features = genes,
+                                    ncol = 3,
+                                    pt.size.factor = 1.6) +
+      plot_annotation(title = paste0("Group D - Cluster ", clust, " Markers"))
+    
+    p_vln <- VlnPlot(group_D_merged, features = genes, ncol = 3, pt.size = 0) +
+      plot_annotation(title = paste0("Group D - Cluster ", clust))
+    
+    print(p_spatial)
+    print(p_vln)
+  }, error = function(e) {
+    cat(paste0("    Error plotting cluster ", clust, ": ", e$message, "\n"))
+  })
+}
+
+dev.off()
+
+cat("Marker visualizations saved to Cluster_Markers_Visualization.pdf\n")
+```
+
+---
+
+# Part 12: Differential Expression Between Groups
+
+## Merge All Samples for Group Comparison
+
+```{r merge-all-samples}
+cat("\n")
+cat(strrep("=", 80), "\n")
+cat("DIFFERENTIAL EXPRESSION: GROUP A vs GROUP D\n")
+cat(strrep("=", 80), "\n\n")
+
+cat("**Important Note:** This comparison assumes matched tissue regions and cell types.\n")
+cat("If tissue composition differs between groups, results may be confounded by\n")
+cat("compositional differences rather than true gene expression changes.n\n")
+
+cat("Merging all samples for group comparison...\n")
+
+all_samples_merged <- merge(x = spatial_filtered[[1]],
+                            y = spatial_filtered[-1],
+                            add.cell.ids = names(spatial_filtered),
+                            project = "All_Samples")
+
+# Add group assignment
+all_samples_merged$group <- ifelse(grepl("^A", all_samples_merged$sample_id), 
+                                   "Group_A", "Group_D")
+
+cat(paste0("  Total spots: ", ncol(all_samples_merged), "\n"))
+cat(paste0("  Group A spots: ", sum(all_samples_merged$group == "Group_A"), "\n"))
+cat(paste0("  Group D spots: ", sum(all_samples_merged$group == "Group_D"), "\n\n"))
+
+# Re-normalize merged dataset
+cat("Re-normalizing merged dataset...\n")
+all_samples_merged <- SCTransform(all_samples_merged, 
+                                  assay = "Spatial",
+                                  vars.to.regress = c("percent.mt", "sample_id"),
+                                  verbose = FALSE)
+
+all_samples_merged <- RunPCA(all_samples_merged, assay = "SCT", npcs = 50, verbose = FALSE)
+all_samples_merged <- RunUMAP(all_samples_merged, reduction = "PCA", dims = 1:30, verbose = FALSE)
+all_samples_merged <- FindNeighbors(all_samples_merged, reduction = "PCA", dims = 1:30, verbose = FALSE)
+all_samples_merged <- FindClusters(all_samples_merged, resolution = 0.5, verbose = FALSE)
+
+cat("Merged dataset processed.n\n")
+```
+
+## Find Differentially Expressed Genes
+
+```{r find-degs}
+cat("Finding differentially expressed genes between groups...\n")
+Idents(all_samples_merged) <- "group"
+
+group_degs <- FindMarkers(all_samples_merged,
+                          ident.1 = "Group_A",
+                          ident.2 = "Group_D",
+                          test.use = "wilcox",
+                          logfc.threshold = 0.25,
+                          min.pct = 0.1,
+                          verbose = FALSE)
+
+# Add gene names and filter for significance
+group_degs$gene <- rownames(group_degs)
+group_degs_sig <- group_degs %>%
+  filter(p_val_adj < 0.05) %>%
+  arrange(desc(abs(avg_log2FC)))
+
+write.csv(group_degs_sig, "Group_A_vs_D_DEGs_significant.csv", row.names = FALSE)
+write.csv(group_degs, "Group_A_vs_D_DEGs_all.csv", row.names = FALSE)
+
+cat(paste0("  Total significant DEGs (FDR < 0.05): ", nrow(group_degs_sig), "\n"))
+if(nrow(group_degs_sig) > 0) {
+  cat(paste0("  Upregulated in Group A: ", sum(group_degs_sig$avg_log2FC > 0), "\n"))
+  cat(paste0("  Upregulated in Group D: ", sum(group_degs_sig$avg_log2FC < 0), "\n"))
+}
+cat("  Results saved to Group_A_vs_D_DEGs_significant.csvn\n")
+```
+
+## Top DEGs
+
+```{r deg-table}
+if(nrow(group_degs_sig) > 0) {
+  top20_degs <- head(group_degs_sig, 20)
+  
+  kable(top20_degs %>% 
+          select(gene, avg_log2FC, pct.1, pct.2, p_val_adj) %>%
+          mutate(Direction = ifelse(avg_log2FC > 0, "Group A", "Group D")), 
+        digits = 3,
+        caption = "Top 20 Differentially Expressed Genes",
+        col.names = c("Gene", "Log2FC", "Pct.1 (A)", "Pct.2 (D)", "Adj. P-value", "Higher in")) %>%
+    kable_styling(bootstrap_options = c("striped", "hover"))
+} else {
+  cat("**No significant DEGs found between groups at FDR < 0.05**n\n")
+  cat("This may indicate:\n")
+  cat("- Similar biological states between groups\n")
+  cat("- High variability within groups\n")
+  cat("- Insufficient power due to sample quality\n")
+}
+```
+
+---
+
+# Part 13: DEG Visualizations
+
+```{r deg-viz, fig.width=14, fig.height=10}
+if(nrow(group_degs_sig) > 0) {
+  cat("Generating DEG visualization plots...\n")
+  
+# Volcano plot
+  p_volcano <- ggplot(group_degs, aes(x = avg_log2FC, y = -log10(p_val_adj))) +
+    geom_point(aes(color = p_val_adj < 0.05 & abs(avg_log2FC) > 0.5), 
+               alpha = 0.6, size = 1) +
+    scale_color_manual(values = c("grey70", "red3"), 
+                       labels = c("Not Significant", "Significant")) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "blue") +
+    geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed", color = "blue") +
+    labs(title = "Differential Expression: Group A vs D",
+         x = "Log2 Fold Change (positive = higher in A)", 
+         y = "-Log10(Adjusted P-value)",
+         color = "Significance") +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+  
+  print(p_volcano)
+  
+ # Top DEGs heatmap
+  if(nrow(group_degs_sig) >= 20) {
+    top_degs <- group_degs_sig %>% top_n(n = 20, wt = abs(avg_log2FC))
+    
+    p_heatmap <- DoHeatmap(all_samples_merged, 
+                           features = top_degs$gene,
+                           group.by = "group",
+                           size = 3) +
+      ggtitle("Top 20 DEGs: Group A vs D")
+    
+    print(p_heatmap)
+  }
+  
+# Feature plots for top DEGs
+  top5_A <- group_degs_sig %>% 
+    filter(avg_log2FC > 0) %>% 
+    top_n(n = 5, wt = avg_log2FC)
+  
+  top5_D <- group_degs_sig %>% 
+    filter(avg_log2FC < 0) %>% 
+    top_n(n = 5, wt = -avg_log2FC)
+  
+  if(nrow(top5_A) > 0 & nrow(top5_D) > 0) {
+  # UMAP feature plots
+    genes_to_plot <- c(head(top5_A$gene, 4), head(top5_D$gene, 4))
+    
+    p_features <- FeaturePlot(all_samples_merged, 
+                              features = genes_to_plot,
+                              reduction = "umap",
+                              ncol = 4)
+    print(p_features)
+    
+  # Violin plots comparing groups
+    genes_to_vln <- c(head(top5_A$gene, 3), head(top5_D$gene, 3))
+    
+    p_vln_compare <- VlnPlot(all_samples_merged,
+                             features = genes_to_vln,
+                             group.by = "group",
+                             ncol = 3,
+                             pt.size = 0)
+    print(p_vln_compare)
+  }
+  
+  cat("DEG visualizations complete.\n")
+} else {
+  cat("No significant DEGs to visualize.\n")
+}
+```
+
+---
+
+# Part 14: Save Final Objects and Results
+
+```{r save-final}
+# Save final merged object
+saveRDS(all_samples_merged, "All_Samples_Merged_Spatial.rds")
+
+cat("All analysis objects saved successfully.\n")
+```
+
+---
+
+# Analysis Summary
+
+```{r final-summary, results='asis'}
+cat("\n")
+cat(strrep("=", 80), "\n")
+cat("ANALYSIS COMPLETE\n")
+cat(strrep("=", 80), "\n\n")
+
+cat("## Saved Objectsn\n")
+cat("**Individual samples:**\n")
+for(sample_id in names(spatial_filtered)) {
+  cat(paste0("- Filtered_", sample_id, "_Spatial.rds\n"))
+}
+cat("\n**Merged objects:**\n")
+cat("- Group_A_Merged_Spatial.rds\n")
+cat("- Group_D_Merged_Spatial.rds\n")
+cat("- All_Samples_Merged_Spatial.rdsn\n")
+
+cat("## Saved Resultsn\n")
+cat("- QC_Filtering_Summary.csv\n")
+cat("- Group_A_Cluster_Markers.csv\n")
+cat("- Group_A_Top10_Markers.csv\n")
+cat("- Group_D_Cluster_Markers.csv\n")
+cat("- Group_D_Top10_Markers.csv\n")
+if(exists("group_degs_sig")) {
+  cat("- Group_A_vs_D_DEGs_significant.csv\n")
+  cat("- Group_A_vs_D_DEGs_all.csv\n")
+}
+cat("\n")
+
+cat("## Generated Plotsn\n")
+cat("- Cluster_Markers_Visualization.pdf\n")
+cat("- Various inline plots in this HTML reportn\n")
+
+cat("## Summary Statisticsn\n")
+
+cat("**QC Filtering:**\n")
+cat(paste0("- Total spots before QC: ", format(sum(qc_summary$Spots_Before), big.mark = ","), "\n"))
+cat(paste0("- Total spots after QC: ", format(sum(qc_summary$Spots_After), big.mark = ","), "\n"))
+cat(paste0("- Overall retention rate: ", round(mean(qc_summary$Percent_Retained), 1), "%n\n"))
+
+cat("**Clustering:**\n")
+cat(paste0("- Group A clusters: ", length(unique(group_A_merged$seurat_clusters)), "\n"))
+cat(paste0("- Group D clusters: ", length(unique(group_D_merged$seurat_clusters)), "\n\n"))
+
+cat("**Marker Genes:**\n")
+if(exists("markers_A")) {
+  cat(paste0("- Group A markers identified: ", nrow(markers_A), "\n"))
+}
+if(exists("markers_D")) {
+  cat(paste0("- Group D markers identified: ", nrow(markers_D), "\n"))
+}
+cat("\n")
+
+cat("**Differential Expression:**\n")
+if(exists("group_degs_sig")) {
+  if(nrow(group_degs_sig) > 0) {
+    cat(paste0("- Significant DEGs (FDR < 0.05): ", nrow(group_degs_sig), "\n"))
+    cat(paste0("- Upregulated in Group A: ", sum(group_degs_sig$avg_log2FC > 0), "\n"))
+    cat(paste0("- Upregulated in Group D: ", sum(group_degs_sig$avg_log2FC < 0), "\n"))
+  } else {
+    cat("- No significant DEGs found between groups\n")
+  }
+}
+cat("\n")
+
+cat(strrep("=", 80), "\n\n")
+```
+
+---
+
+# Key Findings and Interpretations
+
+```{r key-findings, results='asis'}
+cat("## Quality Assessmentn\n")
+
+# Assess overall sample quality
+poor_samples <- qc_summary %>% filter(Median_UMI_After < 500)
+marginal_samples <- qc_summary %>% filter(Median_UMI_After >= 500 & Median_UMI_After < 1000)
+good_samples <- qc_summary %>% filter(Median_UMI_After >= 1000)
+
+if(nrow(poor_samples) > 0) {
+  cat("**Samples with poor quality (Median UMI < 500):**n\n")
+  for(i in 1:nrow(poor_samples)) {
+    cat(paste0("- ", poor_samples$Sample[i], ": ", poor_samples$Median_UMI_After[i], " UMI/spot\n"))
+  }
+  cat("\nThese samples have severe FFPE degradation. Results should be interpreted with extreme caution.n\n")
+}
+
+if(nrow(marginal_samples) > 0) {
+  cat("**Samples with marginal quality (Median UMI 500-1000):**n\n")
+  for(i in 1:nrow(marginal_samples)) {
+    cat(paste0("- ", marginal_samples$Sample[i], ": ", marginal_samples$Median_UMI_After[i], " UMI/spot\n"))
+  }
+  cat("\nThese samples are usable but below optimal FFPE standards. Consider as exploratory.n\n")
+}
+
+if(nrow(good_samples) > 0) {
+  cat("**Samples with acceptable quality (Median UMI >= 1000):**n\n")
+  for(i in 1:nrow(good_samples)) {
+    cat(paste0("- ", good_samples$Sample[i], ": ", good_samples$Median_UMI_After[i], " UMI/spot\n"))
+  }
+  cat("\nThese samples are suitable for analysis with standard caveats for FFPE data.n\n")
+}
+
+cat("## Batch Effectsn\n")
+
+# Summarize batch assessment
+if(exists("batch_A") && exists("batch_D")) {
+  sig_pcs_A <- sum(batch_A$pc_pvalues < 0.05)
+  sig_pcs_D <- sum(batch_D$pc_pvalues < 0.05)
+  
+  cat(paste0("- Group A: ", sig_pcs_A, " PCs significantly associated with sample\n"))
+  cat(paste0("- Group D: ", sig_pcs_D, " PCs significantly associated with samplen\n"))
+  
+  if(sig_pcs_A >= 5 | sig_pcs_D >= 5) {
+    cat("**Strong batch effects detected.** Consider:\n")
+    cat("- Harmony integration for batch correction\n")
+    cat("- Including sample as covariate in DEG analysis\n")
+    cat("- Validating key findings across multiple samplesn\n")
+  } else if(sig_pcs_A >= 2 | sig_pcs_D >= 2) {
+    cat("**Moderate batch effects present.** Results are usable but interpret cluster composition carefully.n\n")
+  } else {
+    cat("**Minimal batch effects.** Sample integration appears successful.n\n")
+  }
+}
+
+cat("## Biological Interpretationn\n")
+
+if(exists("group_degs_sig") && nrow(group_degs_sig) > 0) {
+  cat("Differential expression analysis identified significant differences between Group A and Group D.n\n")
+  cat("**Next steps for interpretation:**\n")
+  cat("1. Perform pathway enrichment analysis (e.g., GO, KEGG) on DEGs\n")
+  cat("2. Validate top DEGs with spatial feature plots\n")
+  cat("3. Check if DEGs localize to specific tissue regions\n")
+  cat("4. Compare findings to published literature for your tissue typen\n")
+} else {
+  cat("No significant DEGs found between groups. This could indicate:\n")
+  cat("- Biological similarity between conditions\n")
+  cat("- High within-group variability masking differences\n")
+  cat("- Insufficient statistical power due to sample quality\n")
+  cat("- Technical noise overwhelming biological signaln\n")
+  cat("Consider cluster-specific comparisons or focus on spatial patterns.n\n")
+}
+```
+
+---
+
+# Recommendations and Next Steps
+
+## Immediate Actions
+
+1. **Review visualizations carefully**
+   - Check UMAP plots for sample-specific clustering (batch effects)
+   - Verify spatial patterns make biological sense
+   - Identify any unexpected patterns or artifacts
+
+2. **Validate key findings**
+   - Use `SpatialFeaturePlot()` to examine top DEGs spatially
+   - Check if marker genes match expected cell types
+   - Compare results to published data for your tissue type
+
+3. **Address batch effects if needed**
+   - If strong batch effects detected, run Harmony integration:
+   
+```r
+# Uncomment to run Harmony
+# library(harmony)
+# group_A_harmony <- RunHarmony(group_A_merged, group.by.vars = "sample_id")
+# group_D_harmony <- RunHarmony(group_D_merged, group.by.vars = "sample_id")
+```
+
+## Additional Analyses
+
+### 1. Cell Type Annotation
+
+Use known marker genes to annotate clusters:
+
+```r
+# Example markers for common cell types
+# epithelial_markers <- c("KRT8", "KRT18", "EPCAM")
+# immune_markers <- c("PTPRC", "CD3D", "CD68")
+# stromal_markers <- c("COL1A1", "VIM", "ACTA2")
+```
+
+### 2. Pathway Enrichment
+
+```r
+# Example using clusterProfiler
+# library(clusterProfiler)
+# library(org.Hs.eg.db)
+# 
+# ego <- enrichGO(gene = deg_genes,
+#                 OrgDb = org.Hs.eg.db,
+#                 ont = "BP",
+#                 pAdjustMethod = "BH",
+#                 qvalueCutoff = 0.05)
+```
+
+### 3. Spatially Variable Genes
+
+```r
+# Find genes with spatial patterns
+# spatial_features <- FindSpatiallyVariableFeatures(obj,
+#                                                    assay = "SCT",
+#                                                    selection.method = "moransi")
+```
+
+### 4. Cell-Cell Communication Analysis
+
+```r
+# Example using CellChat or similar tools
+# Identify spatially co-localized cell types
+# Infer ligand-receptor interactions
+```
+
+## Experimental Recommendations
+
+For future FFPE spatial experiments:
+
+1. **Tissue Processing**
+   - Minimize fixation time (<24 hours optimal)
+   - Ensure complete deparaffinization
+   - Optimize protease digestion
+
+2. **Quality Control**
+   - Process samples in randomized batches
+   - Include positive control tissue
+   - Monitor storage conditions
+
+3. **Sample Selection**
+   - Use recent FFPE blocks (<2 years old)
+   - Avoid over-fixed samples
+   - Request fresh frozen backup if possible
+
+4. **Sequencing Depth**
+   - Target 40,000-50,000 reads/spot for FFPE
+   - Higher depth needed than fresh frozen
+
+---
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```
+
+---
+
+**Analysis completed:** `r Sys.time()`
+
+**Document generated by:** 10x Visium FFPE Spatial Analysis Pipeline
+
+**Key Reference:** This analysis follows standard Seurat workflows (https://satijalab.org/seurat/) and 10x Genomics best practices for FFPE spatial transcriptomics.
