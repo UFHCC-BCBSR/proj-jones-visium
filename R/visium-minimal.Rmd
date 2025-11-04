@@ -1,0 +1,543 @@
+---
+title: "10x Visium Exploratory Analysis: Placental Samples"
+author: "Spatial Analysis"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+knit: (function(input, ...) {
+    rmarkdown::render(
+      input,
+      output_dir = "../results"
+    )
+  })
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 6)
+```
+
+# Overview
+
+## Goal and Questions
+
+**Goal:** Exploratory analysis of 8 Visium FFPE placental samples merged together.
+
+**Key Questions:**
+
+1. What QC issues exist and can we work with these samples?
+
+2. Should we exclude poor-quality samples (A2, D2) or apply spot-level filtering?
+
+3. Do clusters show spatial organization?
+
+4. Do clusters correspond to known placental cell types based on marker expression?
+
+---
+
+```{r libraries}
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(harmony)
+```
+
+## The dataset 
+
+This spatial transcriptomics dataset was generated from eight FFPE human placenta tissue sections using the 10X Visium CytAssist platform with V2 probe-based chemistry. Tissue sections were H&E stained, imaged, and transferred to Visium CytAssist slides containing 55μm capture spots with fixed probe panels targeting the human transcriptome (Visium_Human_Transcriptome_Probe_Set_v2.0_GRCh38-2020-A).
+
+Upstream processing included Space Ranger analysis with manual image alignment performed in Loupe Browser to register H&E images with CytAssist fluorescent images (alignment files provided via --loupe-alignment). Space Ranger outputs include filtered feature-barcode matrices, spatial coordinates, and tissue detection. The GRCh38-2020-A reference genome was used for probe mapping and gene quantification.
+
+We load the filtered feature-barcode matrix (filtered_feature_bc_matrix.h5), which contains only spots classified as under-tissue by Space Ranger's automated tissue detection algorithm and includes UMI counts for detected genes. Additionally, the Seurat v5 function `Load10X_Spatial()` automatically loads spatial metadata from the spatial/ folder, including spot coordinates (tissue_positions.csv), image scaling factors (scalefactors_json.json), and high/low-resolution H&E images (tissue_hires_image.png, tissue_lowres_image.png) required for spatial visualization and overlay of expression data onto tissue morphology.
+
+```{r load-samples}
+# Sample paths
+samples <- c("A1", "A2", "A3", "A4", "D1", "D2", "D3", "D4")
+base_path <- "/orange/cancercenter-dept/JONES/AM_10x_Visium_v2/SpaceRanger_Output_and_Scripts/"
+
+# Load all samples
+spatial_list <- lapply(samples, function(s) {
+  obj <- Load10X_Spatial(
+    data.dir = paste0(base_path, s, "_AM_Spatial_Seq/outs"),
+    filename = "filtered_feature_bc_matrix.h5"
+  )
+  obj$sample_id <- s
+  obj$percent.mt <- PercentageFeatureSet(obj, pattern = "^MT-")
+  obj$percent.mt[is.na(obj$percent.mt)] <- 0
+  return(obj)
+})
+names(spatial_list) <- samples
+```
+
+---
+
+# Goal 1: QC Summary & Problem Identification
+
+These metrics are all reported in detail in each individual sample's [web summaries](https://data.rc.ufl.edu/secure/cancercenter-dept/jones/10X-visium-placenta-2025-10-28/data/web-summaries/). For more information on Visium 10X quality control metrics see [Space Ranger support](https://www.10xgenomics.com/support/software/space-ranger/latest/analysis/outputs/space-ranger-metrics-summary)
+
+```{r qc-summary}
+# Calculate QC metrics
+qc_df <- do.call(rbind, lapply(samples, function(s) {
+  obj <- spatial_list[[s]]
+  data.frame(
+    Sample = s,
+    Total_Spots = ncol(obj),
+    Median_UMI = median(obj$nCount_Spatial),
+    Median_Genes = median(obj$nFeature_Spatial),
+    Mean_MT = round(mean(obj$percent.mt), 1),
+    Spots_LowGenes = sum(obj$nFeature_Spatial < 200),
+    Spots_HighMT = sum(obj$percent.mt > 25)
+  )
+}))
+
+knitr::kable(qc_df, caption = "QC Metrics Summary")
+```
+
+## Low Quality Samples Identified
+
+```{r problem-samples}
+# Flag problematic samples
+qc_df$QC_Flag <- ifelse(qc_df$Median_UMI < 500 | qc_df$Mean_MT > 20, 
+                         "Poor Quality", "Acceptable")
+
+# Print problems
+cat("**Samples with Quality Issues:**\n\n")
+problem_samples <- qc_df[qc_df$QC_Flag == "Poor Quality", ]
+for(i in 1:nrow(problem_samples)) {
+  cat(paste0("- **", problem_samples$Sample[i], "**: "))
+  if(problem_samples$Median_UMI[i] < 500) {
+    cat(paste0("Low UMI count (", problem_samples$Median_UMI[i], "). "))
+  }
+  if(problem_samples$Mean_MT[i] > 20) {
+    cat(paste0("High MT% (", problem_samples$Mean_MT[i], "%). "))
+  }
+  cat("\n")
+}
+```
+
+## Why These Problems Occur
+
+**Low UMI counts (<500):**
+
+- FFPE fixation degrades RNA, reducing captured transcripts
+
+- Poor tissue quality or processing
+
+- **Impact:** Reduces power to detect genes; more noise in clustering
+
+**High mitochondrial % (>20%):**
+
+- Poor sample quality, leading to a high fraction of apoptotic or lysing cells.
+
+- Biology of the particular sample, for example, tumor biopsies, may have increased mitochondrial gene expression due to metabolic activity and/or necrosis.
+
+- **Impact:** Cells may cluster by mitochonrdial count. Filtering high mitochondrial transcript barcodes can improve clustering results. 
+
+---
+
+# Goal 2: Merge Samples
+
+## QC Filter the Dataset before Integration
+
+**Slice-level filtering** INCLUDE A2/D2 with spot-level filtering to explore patterns, maybe want to remove later if their inclusion drives artifacts (e.g. technical effect clusters)
+
+**Spot-level filtering** Remove spots with <200 genes OR >25% MT
+
+```{r apply-qc-filter}
+# Apply spot-level QC to all samples
+spatial_filtered <- lapply(spatial_list, function(obj) {
+  upper_limit <- quantile(obj$nFeature_Spatial, 0.99)
+  subset(obj, subset = nFeature_Spatial > 200 & 
+                       nFeature_Spatial < upper_limit & 
+                       percent.mt < 25)
+})
+
+# Report filtering results
+filter_summary <- do.call(rbind, lapply(samples, function(s) {
+  before <- ncol(spatial_list[[s]])
+  after <- ncol(spatial_filtered[[s]])
+  data.frame(
+    Sample = s,
+    Spots_Before = before,
+    Spots_After = after,
+    Percent_Retained = round(100 * after/before, 1)
+  )
+}))
+
+knitr::kable(filter_summary, caption = "Spot-Level QC Filtering Results")
+```
+
+## Sample Integration
+
+We integrate all 8 samples together using the standard Seurat integration workflow:
+
+1. **Normalize** each sample with `SCTransform()` (Hafemeister & Satija, 2019)
+
+2. **Merge** samples with `merge()`
+
+3. **Integrate** with `RunHarmony()` (Korsunsky et al., 2019) to align shared cell types across samples
+
+4. **Cluster** on integrated embeddings with `FindNeighbors()` and `FindClusters()`
+
+5. **Visualize** with `RunUMAP()`
+
+Our goal is to learn shared cell types/states across slices so that we can make comparisons between groups.
+
+- Integration **aligns the same cell types** across samples (e.g., all trophoblasts cluster together)
+
+- Biological differences **within each cell type** are preserved
+
+- This enables downstream comparison: "How do trophoblasts differ between Group A and Group B?"
+
+This is the standard Seurat v5 integration workflow for multi-sample, multi-condition datasets.
+
+```{r merge-all-samples}
+merged_file <- "../results/merged-seurat.Rds"
+
+if(file.exists(merged_file)) {
+  cat("Loading existing merged object from disk...\n")
+  merged_all <- readRDS(merged_file)
+  cat(paste0("Loaded: ", ncol(merged_all), " spots, ",
+             length(unique(merged_all$seurat_clusters)), " clusters\n"))
+  
+} else {
+
+  # Process each sample: normalize and reduce dimensions
+  spatial_processed <- lapply(spatial_filtered, function(obj) {
+    obj <- SCTransform(obj, assay = "Spatial", vars.to.regress = "percent.mt", verbose = FALSE)
+    obj <- RunPCA(obj, npcs = 30, verbose = FALSE)
+    return(obj)
+  })
+  
+  # Merge all samples together
+  merged_all <- merge(spatial_processed[[1]],
+                      y = spatial_processed[-1],
+                      add.cell.ids = samples)
+  
+  cat(paste0("Merged object: ", ncol(merged_all), " total spots from ",
+             length(samples), " samples\n"))
+  
+  # Re-process merged object with Harmony integration
+  merged_all <- SCTransform(merged_all, assay = "Spatial", vars.to.regress = "percent.mt", verbose = FALSE)
+  
+  merged_all <- RunPCA(merged_all, npcs = 30, verbose = FALSE)
+  
+  merged_all <- RunHarmony(merged_all, group.by.vars = "sample_id", dims = 1:30, verbose = FALSE)
+  
+  merged_all <- RunUMAP(merged_all, reduction = "harmony", dims = 1:30, verbose = FALSE)
+  
+  merged_all <- FindNeighbors(merged_all, reduction = "harmony", dims = 1:30, verbose = FALSE)
+  merged_all <- FindClusters(merged_all, resolution = 0.5, verbose = FALSE)
+  
+  cat(paste0("Final merged object: ", ncol(merged_all), " spots, ",
+             length(unique(merged_all$seurat_clusters)), " clusters\n"))
+  
+  # Save processed object
+  saveRDS(merged_all, file = merged_file)
+}
+```
+
+---
+
+# Goal 3: Spatial Visualization with Clear H&E
+
+## View Clusters on Integrated Spots
+
+We visualize the integrated dataset to understand:
+
+1. How samples mix after integration (do they overlap or remain separate?)
+
+2. Where clusters are located in UMAP space
+
+**What is UMAP space?**
+
+UMAP (Uniform Manifold Approximation and Projection) takes our high-dimensional gene expression data (~20,000 genes) and projects it into 2 dimensions for visualization. **Key principle:** Spots that are close together in UMAP space have similar gene expression profiles; spots far apart have different profiles.
+
+**Why do we care?**
+
+- **Distinct clusters** = different cell types or tissue regions with unique expression signatures
+
+- **Overlapping clusters** = may be technical artifacts or gradual transitions between cell states
+
+- **Samples mixing** = integration worked (technical differences removed)
+
+- **Samples separating** = may indicate unintegrated batch effects OR real biological differences
+
+At this exploratory stage, UMAP helps us assess whether our integration and clustering captured meaningful biological variation.
+
+```{r merged-overview, fig.width=14, fig.height=6}
+# Show sample composition
+p1 <- DimPlot(merged_all, reduction = "umap", group.by = "sample_id") +
+  ggtitle("All Samples - Colored by Sample ID")
+
+p2 <- DimPlot(merged_all, reduction = "umap", label = TRUE) +
+  ggtitle("All Samples - Clusters")
+
+print(p1 | p2)
+```
+
+## View Clusters on Spatial Coordinates
+
+**Goal:** Determine if clusters correspond to distinct anatomical regions in the tissue.
+
+**What we're looking for:**
+
+- **Strong spatial patterns**: Clusters localized to specific tissue regions (e.g., all purple spots in one area)
+
+- **Scattered patterns**: Clusters spread throughout tissue, suggesting technical artifacts or cell states not tied to anatomy
+
+Many spatial transcriptomics datasets show clear spatial organization where clusters map to visible tissue structures [see example here:](https://satijalab.org/seurat/articles/spatial_vignette.html). 
+
+However, **this dataset shows minimal spatial organization** - most clusters are scattered across tissue regions rather than localized. This suggests:
+
+- Clusters may reflect cell type mixtures or functional states rather than anatomical compartments
+
+- FFPE quality issues may reduce spatial signal
+
+- Placental tissue may have intermixed cell populations
+
+```{r improved-spatial-viz, fig.width=8, fig.height=8}
+image_names <- Images(merged_all)
+
+# Create a mapping of image names to sample IDs
+sample_id_map <- setNames(samples, image_names)
+
+# Plot each slice separately with improved visibility
+for(img in image_names) {
+  p <- SpatialDimPlot(merged_all,
+                      images = img,
+                      label = TRUE,
+                      label.size = 8,
+                      label.box = TRUE,
+                      repel = TRUE,
+                      pt.size.factor = 4,
+                      alpha = 1,
+                      stroke = 0.5,
+                      image.alpha = 0.3) +
+    ggtitle(paste0("Sample ", sample_id_map[img], " - Merged Clusters on H&E")) +
+    labs(fill = "Seurat Clusters") +  # Change legend title
+    guides(fill = guide_legend(override.aes = list(size = 6))) +  # Bigger legend points
+    theme(
+      legend.text = element_text(size = 14),
+      legend.key.size = unit(1, "cm"),
+      plot.title = element_text(size = 16, face = "bold")
+    )
+  print(p)
+}
+```
+
+**Interpretation:** This dataset shows limited spatial organization of clusters. Placental tissue may naturally have intermixed cell populations without sharp anatomical boundaries, unlike tissues with clear zonation (e.g., kidney cortex vs. medulla, brain regions).
+
+---
+
+# Goal 4: Visualize Expression of Placental Cell Type Markers
+
+To assign cell type identities to the unsupervised clusters, we visualized canonical marker gene expression patterns overlaid on the UMAP. By comparing cluster boundaries with marker expression intensity, we can identify which clusters correspond to specific placental cell populations. High expression of a cell type marker within a cluster indicates that cluster likely represents that cell type.
+
+We visualize key marker genes for major placental cell types including trophoblasts (CGB, PSG1, ERVW1, CYP19A1), Hofbauer cells/myeloid cells (CD68, CD163, FOLR2), stromal fibroblasts (COL1A1, DCN, VIM), and endothelial cells (PECAM1, VWF, CDH5). 
+
+There are many ways to do cluster and spot annotation (reference-based annotation, module scores based annotation), but this basic approach is useful for exploring the data.
+
+```{r define-markers}
+# Key placental markers
+markers <- list(
+  Trophoblast = c("CGB", "PSG1", "ERVW1", "CYP19A1"),
+  Myeloid = c("CD68", "CD163", "FOLR2"),  # Hofbauer cells
+  Fibroblast = c("COL1A1", "DCN", "VIM"),
+  Endothelial = c("PECAM1", "VWF", "CDH5")
+)
+
+# Find which markers are detected
+detected_markers <- lapply(markers, function(genes) {
+  genes[genes %in% rownames(merged_all)]
+})
+detected_markers <- detected_markers[sapply(detected_markers, length) > 0]
+
+cat("**Detected markers:**\n")
+for(cell_type in names(detected_markers)) {
+  cat(paste0("- ", cell_type, ": ", paste(detected_markers[[cell_type]], collapse = ", "), "\n"))
+}
+```
+
+## Marker Visualization: Clusters vs. Expression
+
+To identify cell type identities of the unsupervised clusters, we visualized the co-expression of canonical marker genes for each major placental cell population. For each cell type, the mean normalized expression across all detected markers was calculated and displayed on the UMAP, with higher intensity indicating stronger cell type signature. Clusters showing high co-expression scores likely represent that specific cell type.
+
+```{r marker-visualization, fig.width=12, fig.height=5}
+# Function to plot clusters alongside marker co-expression
+plot_cluster_vs_coexpression <- function(obj, marker_genes, cell_type) {
+  # Filter out any undetected markers
+  detected <- marker_genes[marker_genes %in% rownames(obj)]
+  
+  if(length(detected) == 0) {
+    cat(paste0("No markers detected for ", cell_type, "\n"))
+    return(NULL)
+  }
+  
+  p1 <- DimPlot(obj, reduction = "umap", label = TRUE) +
+    ggtitle("Clusters") +
+    theme(legend.position = "right")
+  
+  # Calculate mean expression across all markers for true co-expression
+  if(length(detected) > 1) {
+    # Get expression matrix and calculate average
+    expr_data <- FetchData(obj, vars = detected)
+    obj$coexpression <- rowMeans(expr_data)
+    
+    p2 <- FeaturePlot(obj, features = "coexpression", reduction = "umap",
+                      order = TRUE,           # Plot high expression on top
+                      pt.size = 0.3) +        # Slightly smaller points
+      ggtitle(paste0(cell_type, " - Mean Co-expression (", 
+                     length(detected), " markers)")) +
+      scale_color_viridis_c(option = "magma")
+  } else {
+    # Single marker
+    p2 <- FeaturePlot(obj, features = detected, reduction = "umap",
+                      order = TRUE,           # Plot high expression on top
+                      pt.size = 0.3) +
+      ggtitle(paste0(cell_type, " - ", detected)) +
+      scale_color_viridis_c(option = "magma")
+  }
+  
+  return(p1 | p2)
+}
+
+# Plot co-expression for each cell type
+for(cell_type in names(detected_markers)) {
+  p <- plot_cluster_vs_coexpression(merged_all, 
+                                    detected_markers[[cell_type]], 
+                                    cell_type)
+  if(!is.null(p)) print(p)
+}
+```
+
+## Visualization of H&E with clusters identified as highly expression marker genes 
+
+For the marker genes with expression that appeared localized to specific clusters, we can highlight those clusters on the H&E images like we did above but this time looking only at spots in these clusters in order to make the pattern clearer and see whether these clusters (and potentially cell types) have a spatial pattern.
+
+```{r spatial-clusters}
+# Function to highlight specific clusters
+plot_highlighted_clusters <- function(obj, img, highlight_clusters, title_suffix = "") {
+  # Get all cluster identities
+  all_clusters <- levels(Idents(obj))
+  
+  # Create color vector: highlighted clusters get their default colors, rest are gray
+  colors <- rep("gray85", length(all_clusters))
+  names(colors) <- all_clusters
+  
+  # Use default Seurat colors for highlighted clusters
+  default_colors <- scales::hue_pal()(length(all_clusters))
+  colors[as.character(highlight_clusters)] <- default_colors[highlight_clusters + 1]
+  
+  p <- SpatialDimPlot(obj,
+                      images = img,
+                      cols = colors,  # Apply custom colors
+                      label = TRUE,
+                      label.size = 8,
+                      label.box = TRUE,
+                      repel = TRUE,
+                      pt.size.factor = 4,
+                      alpha = 1,
+                      stroke = 0.5,
+                      image.alpha = 0.3) +
+    ggtitle(paste0("Sample ", sample_id_map[img], " - ", title_suffix)) +
+    labs(fill = "Seurat Clusters") +
+    guides(fill = guide_legend(override.aes = list(size = 6))) +
+    theme(
+      legend.text = element_text(size = 14),
+      legend.key.size = unit(1, "cm"),
+      plot.title = element_text(size = 16, face = "bold")
+    )
+  return(p)
+}
+```
+
+**Highlight clusters with high expression of trophoblast marker CYP19A1 (clusters 1 and 8)**
+
+```{r trophoblast}
+# Highlight trophoblast clusters (1, 8)
+for(img in image_names) {
+  p <- plot_highlighted_clusters(merged_all, img, 
+                                 highlight_clusters = c(1, 8),
+                                 title_suffix = "Trophoblast Clusters (1, 8)")
+  print(p)
+}
+```
+
+**Highlight clusters with high co-expression of fibroblast markers COL1A1, DCN, VIM (clusters 2 and 5)**
+
+```{r fibroblast}
+# Highlight fibroblast clusters (2, 5)
+for(img in image_names) {
+  p <- plot_highlighted_clusters(merged_all, img, 
+                                 highlight_clusters = c(2, 5),
+                                 title_suffix = "Fibroblast Clusters (2, 5)")
+  print(p)
+}
+```
+
+```{r make-cloupe}
+library(loupeR)
+
+# Check if .cloupe file already exists
+cloupe_file <- "../results/integrated_spatial_analysis.cloupe"
+
+if(!file.exists(cloupe_file)) {
+  create_loupe_from_seurat(
+    merged_all,
+    output_name = "../results/integrated_spatial_analysis",
+    force = TRUE
+  )
+}
+```
+---
+
+# Summary
+
+## Download Integrated Data for Loupe Browser
+
+The 10X Space Ranger analysis outputs individual .cloupe files per sample (located in each sample's outs/ folder), which can be opened in [The 10X Loupe Browser](https://www.10xgenomics.com/support/software/loupe-browser/latest) to visualize spatial gene expression and tissue morphology.
+
+To facilitate exploration of the integrated clustering results across all eight samples, we additionally provide a .cloupe file of the merged dataset containing the shared cluster identities derived from our integration analysis. This allows interactive visualization of how clusters span across samples and interrogation of cluster-specific gene expression patterns.
+
+[**Download integrated data for interactive exploration in loupe browser**](https://data.rc.ufl.edu/secure/cancercenter-dept/jones/10X-visium-placenta-2025-10-2/results/integrated_spatial_analysis.cloupe)
+
+Note: Individual per-sample .cloupe files with full-resolution H&E images are available in the Space Ranger output directories.
+
+
+## Key Findings
+
+1. **QC Issues:** Samples A2 and D2 have poor quality but retained with spot-level filtering
+2. **Integration:** Successfully integrated all 8 samples using Harmony to correct batch effects
+3. **Total Data:** `r ncol(merged_all)` spots across `r length(unique(merged_all$seurat_clusters))` clusters
+4. **Spatial Clusters:** Clusters show some spatial organization but vary by sample
+5. **Cell Types:** Detected localized trophoblast, myeloid, fibroblast markers; localization of endothelial markers across spots is unclear.
+
+## Next Steps
+
+- Determine if A2/D2 drive spurious clustering patterns (re-run without them)
+
+- Deeper investigation of spatially-localized clusters
+
+- Find cluster-specific markers
+
+- Compare tissue regions or conditions if applicable
+
+# References
+
+- Hao, Y., Stuart, T., Kowalski, M.H., Choudhary, S., Hoffman, P., Hartman, A., Srivastava, A., Molla, G., Madad, S., Fernandez-Granda, C., and Satija, R. (2023). Dictionary learning for integrative, multimodal and scalable single-cell analysis. *Nature Biotechnology*. doi: 10.1038/s41587-023-01767-y
+
+- Hafemeister, C. & Satija, R. Normalization and variance stabilization of single-cell RNA-seq data using regularized negative binomial regression. *Genome Biology* **20**, 296 (2019)
+
+- Korsunsky, I. et al. Fast, sensitive and accurate integration of single-cell data with Harmony. *Nature Methods* **16**, 1289–1296 (2019)
+
+---
+
+```{r session-info}
+sessionInfo()
+```
