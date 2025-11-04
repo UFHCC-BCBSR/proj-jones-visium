@@ -1,4 +1,4 @@
-# 10x Visium FFPE Spatial Transcriptomics Analysis Pipeline
+# 10x Visium FFPE Spatial Transcriptomics Exploration
 
 ## Project Overview
 
@@ -82,12 +82,11 @@ access.
 ### Reports
 
 -   `results/qc-summary.html` - HTML report with detailed QC assessments
--   `results/visium-minimal.html` - HTML report with basic
-    normalization, integration, and visualizations
+-   `results/visium-minimal.html` - HTML report with basic normalization, integration, and visualizations
 
 ### Processed Seurat Objects
 
--   `results/merged-seurat.rds` - Integrated samples
+-   `results/merged-seurat.rds` - Integrated samples R object to load into R for further analysis
 -   `results/integrated_spatial_analysis.cloupe` - cloupe file of
     integrated sample data for exploration in 10X Loupe Browser
 
