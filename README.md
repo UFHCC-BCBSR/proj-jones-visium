@@ -1,9 +1,3 @@
----
-editor_options: 
-  markdown: 
-    wrap: 72
----
-
 # 10x Visium FFPE Spatial Transcriptomics Analysis Pipeline
 
 ## Project Overview
